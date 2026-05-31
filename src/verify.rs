@@ -1,7 +1,7 @@
 use crate::litematic::{
     CollisionBox, FaceDirection, LoadedSchematic, WaterCell, block_at, block_full_id,
     blocks_motion, collision_boxes, is_collision_shape_full_block, is_face_sturdy, load_litematic,
-    water_at,
+    merged_face_occludes, water_at,
 };
 use crate::{
     AABB_DEFLATE, BUOYANCY, BUOYANCY_CAP, FLUID_CURRENT_EPSILON2, FLUID_CURRENT_MIN_IMPULSE,
@@ -159,6 +159,15 @@ impl HorizontalDir {
             Self::South => [0, 0, 1],
             Self::West => [-1, 0, 0],
             Self::East => [1, 0, 0],
+        }
+    }
+
+    fn face(self) -> FaceDirection {
+        match self {
+            Self::North => FaceDirection::North,
+            Self::South => FaceDirection::South,
+            Self::West => FaceDirection::West,
+            Self::East => FaceDirection::East,
         }
     }
 
@@ -383,8 +392,14 @@ fn get_new_water(region: &Region, pos: [i32; 3], state: &Block) -> Option<Dynami
     let above_pos = offset_pos(pos, [0, 1, 0]);
     if let Some(above_block) = block_at(region, above_pos) {
         if let Some(above_fluid) = dynamic_water_state_at(region, above_pos) {
-            if can_pass_through_wall_vertical(region, pos, state, above_pos, above_block)
-                && above_fluid.amount > 0
+            if can_pass_through_wall_vertical(
+                region,
+                pos,
+                state,
+                above_pos,
+                above_block,
+                FaceDirection::Up,
+            ) && above_fluid.amount > 0
             {
                 return Some(DynamicWaterState {
                     amount: 8,
@@ -522,7 +537,14 @@ fn is_water_hole(
     bottom_pos: [i32; 3],
     bottom_state: &Block,
 ) -> bool {
-    if !can_pass_through_wall_vertical(region, top_pos, top_state, bottom_pos, bottom_state) {
+    if !can_pass_through_wall_vertical(
+        region,
+        top_pos,
+        top_state,
+        bottom_pos,
+        bottom_state,
+        FaceDirection::Down,
+    ) {
         return false;
     }
     dynamic_water_state_at(region, bottom_pos).is_some() || can_hold_specific_fluid(bottom_state)
@@ -557,6 +579,7 @@ fn can_maybe_pass_through(
                     source_state,
                     target_pos,
                     target_state,
+                    FaceDirection::Down,
                 )
             })
 }
@@ -642,16 +665,12 @@ fn can_pass_through_wall(
     source_state: &Block,
     _target_pos: [i32; 3],
     target_state: &Block,
-    _direction: HorizontalDir,
+    direction: HorizontalDir,
 ) -> bool {
     if is_collision_shape_full_block(source_state) || is_collision_shape_full_block(target_state) {
         return false;
     }
-    let source_shape = collision_boxes(source_state);
-    let target_shape = collision_boxes(target_state);
-    source_shape.is_empty()
-        || target_shape.is_empty()
-        || (!blocks_motion(source_state) && !blocks_motion(target_state))
+    !merged_face_occludes(source_state, target_state, direction.face())
 }
 
 fn can_pass_through_wall_vertical(
@@ -660,11 +679,12 @@ fn can_pass_through_wall_vertical(
     source_state: &Block,
     _target_pos: [i32; 3],
     target_state: &Block,
+    direction: FaceDirection,
 ) -> bool {
     if is_collision_shape_full_block(source_state) || is_collision_shape_full_block(target_state) {
         return false;
     }
-    true
+    !merged_face_occludes(source_state, target_state, direction)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2244,6 +2264,21 @@ mod tests {
         );
         assert!(move_result.collided_x);
         assert!(move_result.delta.x < 1.0);
+    }
+
+    #[test]
+    fn partial_horizontal_faces_do_not_fully_occlude_flow() {
+        let source = parse_block("minecraft:oak_slab[type=top]");
+        let target = parse_block("minecraft:oak_slab[type=top]");
+        let region = region_with_shape([1, 1, 1]);
+        assert!(can_pass_through_wall(
+            &region,
+            [0, 0, 0],
+            &source,
+            [1, 0, 0],
+            &target,
+            HorizontalDir::East,
+        ));
     }
 
     #[test]

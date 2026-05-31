@@ -44,6 +44,8 @@ pub(crate) enum FaceDirection {
     South,
     West,
     East,
+    Down,
+    Up,
 }
 
 impl CollisionBoxes {
@@ -160,6 +162,19 @@ pub(crate) fn is_collision_shape_full_block(block: &Block) -> bool {
     matches!(collision_kind(block), CollisionKind::FullBlock)
 }
 
+pub(crate) fn merged_face_occludes(
+    source: &Block,
+    target: &Block,
+    direction: FaceDirection,
+) -> bool {
+    let mut rectangles = face_rectangles(&collision_boxes(source), direction);
+    rectangles.extend(face_rectangles(
+        &collision_boxes(target),
+        direction.opposite(),
+    ));
+    rectangles_cover_unit_square(&rectangles)
+}
+
 pub(crate) fn is_face_sturdy(block: &Block, direction: FaceDirection) -> bool {
     if block.is_air() || is_water_block(block) || is_ice(block) {
         return false;
@@ -177,6 +192,10 @@ pub(crate) fn blocks_motion(block: &Block) -> bool {
 }
 
 fn face_is_full(boxes: &CollisionBoxes, direction: FaceDirection) -> bool {
+    rectangles_cover_unit_square(&face_rectangles(boxes, direction))
+}
+
+fn face_rectangles(boxes: &CollisionBoxes, direction: FaceDirection) -> Vec<(f64, f64, f64, f64)> {
     let mut rectangles = Vec::with_capacity(4);
     for collision_box in boxes.iter() {
         let rectangle = match direction {
@@ -204,13 +223,25 @@ fn face_is_full(boxes: &CollisionBoxes, direction: FaceDirection) -> bool {
                 collision_box.min_y,
                 collision_box.max_y,
             )),
+            FaceDirection::Down if approx_eq(collision_box.min_y, 0.0) => Some((
+                collision_box.min_x,
+                collision_box.max_x,
+                collision_box.min_z,
+                collision_box.max_z,
+            )),
+            FaceDirection::Up if approx_eq(collision_box.max_y, 1.0) => Some((
+                collision_box.min_x,
+                collision_box.max_x,
+                collision_box.min_z,
+                collision_box.max_z,
+            )),
             _ => None,
         };
         if let Some(rectangle) = rectangle {
             rectangles.push(rectangle);
         }
     }
-    rectangles_cover_unit_square(&rectangles)
+    rectangles
 }
 
 fn rectangles_cover_unit_square(rectangles: &[(f64, f64, f64, f64)]) -> bool {
@@ -271,6 +302,19 @@ fn sort_and_dedup_boundaries(values: &mut Vec<f64>) {
 
 fn approx_eq(left: f64, right: f64) -> bool {
     (left - right).abs() <= 1.0e-9
+}
+
+impl FaceDirection {
+    fn opposite(self) -> Self {
+        match self {
+            Self::North => Self::South,
+            Self::South => Self::North,
+            Self::West => Self::East,
+            Self::East => Self::West,
+            Self::Down => Self::Up,
+            Self::Up => Self::Down,
+        }
+    }
 }
 
 pub(crate) fn is_ice(block: &Block) -> bool {
