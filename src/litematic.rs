@@ -404,6 +404,8 @@ fn supported_partial_collision_kind(block: &Block) -> Option<CollisionKind> {
         || block.id.ends_with("bars")
         || block.id.ends_with("wall")
         || block.id.ends_with("fence")
+        || is_standing_sign_block(block)
+        || is_wall_sign_block(block)
     {
         return Some(CollisionKind::PartialBlock);
     }
@@ -420,6 +422,12 @@ fn supported_partial_collision_kind(block: &Block) -> Option<CollisionKind> {
 fn supported_partial_collision_boxes(block: &Block) -> CollisionBoxes {
     if block.id.ends_with("slab") {
         return slab_collision_boxes(block);
+    }
+    if is_wall_sign_block(block) {
+        return wall_sign_collision_boxes(block);
+    }
+    if is_standing_sign_block(block) {
+        return standing_sign_collision_boxes();
     }
     if block.id.ends_with("trapdoor") {
         return trapdoor_collision_boxes(block);
@@ -443,6 +451,42 @@ fn supported_partial_collision_boxes(block: &Block) -> CollisionBoxes {
         return fence_collision_boxes(block);
     }
     CollisionBoxes::empty()
+}
+
+fn is_standing_sign_block(block: &Block) -> bool {
+    block.namespace == "minecraft"
+        && block.id.ends_with("sign")
+        && !block.id.ends_with("wall_sign")
+        && !block.id.ends_with("hanging_sign")
+}
+
+fn is_wall_sign_block(block: &Block) -> bool {
+    block.namespace == "minecraft" && block.id.ends_with("wall_sign")
+}
+
+fn standing_sign_collision_boxes() -> CollisionBoxes {
+    CollisionBoxes::single(centered_column_box(8.0 / 16.0, 1.0))
+}
+
+fn wall_sign_collision_boxes(block: &Block) -> CollisionBoxes {
+    let facing = horizontal_direction(
+        block
+            .attributes
+            .get("facing")
+            .map(String::as_str)
+            .unwrap_or("north"),
+    );
+    CollisionBoxes::single(rotate_y_clockwise(
+        CollisionBox {
+            min_x: 0.0,
+            min_y: 4.5 / 16.0,
+            min_z: 14.0 / 16.0,
+            max_x: 1.0,
+            max_y: 12.5 / 16.0,
+            max_z: 1.0,
+        },
+        horizontal_turns(facing),
+    ))
 }
 
 fn slab_collision_boxes(block: &Block) -> CollisionBoxes {

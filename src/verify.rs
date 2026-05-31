@@ -659,16 +659,21 @@ fn water_at_single_block(block: &Block) -> Option<WaterCell> {
 }
 
 fn is_waterloggable_block(block: &Block) -> bool {
-    block.namespace == "minecraft"
-        && (block.id.ends_with("slab")
-            || block.id.ends_with("stairs")
-            || block.id.ends_with("trapdoor")
-            || block.id.ends_with("fence")
-            || block.id.ends_with("pane")
-            || block.id.ends_with("bars")
-            || block.id.ends_with("wall"))
-        && !block.id.ends_with("fence_gate")
-        && !block.id.ends_with("door")
+    if block.namespace != "minecraft"
+        || block.id.ends_with("fence_gate")
+        || block.id.ends_with("door")
+    {
+        return false;
+    }
+
+    block.id.ends_with("slab")
+        || block.id.ends_with("stairs")
+        || block.id.ends_with("trapdoor")
+        || block.id.ends_with("fence")
+        || block.id.ends_with("pane")
+        || block.id.ends_with("bars")
+        || block.id.ends_with("wall")
+        || (block.id.ends_with("sign") && !block.id.ends_with("hanging_sign"))
 }
 
 fn slab_is_double(block: &Block) -> bool {
@@ -2440,6 +2445,45 @@ mod tests {
             block.attributes.get("waterlogged").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn spread_to_wall_sign_keeps_block_and_sets_waterlogged() {
+        let mut region = region_with_shape([1, 1, 1]);
+        let sign = parse_block("minecraft:oak_wall_sign[facing=north,waterlogged=false]");
+        region.set_block([0, 0, 0], &sign).unwrap();
+        let mut fluid_ticks = DynamicFluidTicks::default();
+        fluid_ticks.spread_to(
+            &mut region,
+            [0, 0, 0],
+            &sign,
+            DynamicWaterState {
+                amount: 8,
+                falling: false,
+            },
+            0,
+        );
+        let block = block_at(&region, [0, 0, 0]).expect("waterlogged wall sign");
+        assert_eq!(block.id, "oak_wall_sign");
+        assert_eq!(
+            block.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn wall_sign_collision_box_matches_vanilla_shape() {
+        let sign = parse_block("minecraft:oak_wall_sign[facing=north,waterlogged=false]");
+        let boxes = collision_boxes(&sign);
+        let mut iter = boxes.iter();
+        let shape = iter.next().expect("wall sign shape");
+        assert!(iter.next().is_none());
+        assert!((shape.min_x - 0.0).abs() < 1.0e-12);
+        assert!((shape.max_x - 1.0).abs() < 1.0e-12);
+        assert!((shape.min_y - 4.5 / 16.0).abs() < 1.0e-12);
+        assert!((shape.max_y - 12.5 / 16.0).abs() < 1.0e-12);
+        assert!((shape.min_z - 14.0 / 16.0).abs() < 1.0e-12);
+        assert!((shape.max_z - 1.0).abs() < 1.0e-12);
     }
 
     #[test]
