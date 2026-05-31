@@ -5,14 +5,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+mod litematic;
+mod verify;
+use verify::run_verify_command;
 
 const WIDTH: f64 = 0.25;
 const HEIGHT: f64 = 0.25;
+pub(crate) const VERIFY_DEFAULT_WIDTH: f64 = WIDTH;
+pub(crate) const VERIFY_DEFAULT_HEIGHT: f64 = HEIGHT;
 const FLUID_MOVEMENT_THRESHOLD: f64 = 0.1;
 const WATER_PUSH: f64 = 0.014;
 const HORIZONTAL_WATER_DAMPING: f64 = 0.99_f32 as f64;
 const HORIZONTAL_MOVEMENT_DAMPING: f64 = 0.98_f32 as f64;
-const VERTICAL_MOVEMENT_DAMPING: f64 = 0.98;
+const VERTICAL_MOVEMENT_DAMPING: f64 = 0.98_f32 as f64;
 const GRAVITY: f64 = 0.04;
 const BUOYANCY: f64 = 5.0e-4_f32 as f64;
 const BUOYANCY_CAP: f64 = 0.06_f32 as f64;
@@ -31,6 +36,14 @@ const FLUID_CURRENT_EPSILON2: f64 = 1.0e-5_f32 as f64;
 pub enum Mode {
     Early,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortPreset {
+    Fast,
+    Balanced,
+    Deep,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +65,9 @@ pub struct Args {
     pub dedupe_long: bool,
     pub full_cadence_pairs: usize,
     pub full_cadence_tolerance: f64,
+    pub target_distance: usize,
+    pub target_ticks: usize,
+    pub target_speed: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed_start_offsets: Option<Vec<f64>>,
     pub start_y: f64,
@@ -60,9 +76,47 @@ pub struct Args {
     pub start_on_ground: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchCommand {
+    pub out: PathBuf,
+    pub top: usize,
+    pub target_speed: f64,
+    pub effort: EffortPreset,
+    pub export_cycles: usize,
+    pub export_top_count: usize,
+    pub start_y: f64,
+    pub start_vx: f64,
+    pub start_vy: f64,
+    pub start_on_ground: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyCommand {
+    pub input: PathBuf,
+    pub out: PathBuf,
+    pub target_speed: f64,
+    pub ticks: usize,
+    pub inspect_tick: Option<usize>,
+    pub start_x: f64,
+    pub start_y: f64,
+    pub start_z: f64,
+    pub start_vx: f64,
+    pub start_vy: f64,
+    pub start_vz: f64,
+    pub start_on_ground: bool,
+    pub width: f64,
+    pub height: f64,
+    pub entity_id_mod4: usize,
+    pub initial_tick_count: usize,
+}
+
 pub enum ParsedArgs {
     Help(String),
     Run(Args),
+    Search(SearchCommand),
+    Verify(VerifyCommand),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -499,11 +553,27 @@ impl Layout {
 }
 
 pub fn usage() -> String {
-    "Usage: cargo run --release -- [--out <dir>] [--ticks 500] [--top 80] [--max-prefix 8]\n\nSearches transition prefixes for a slime-piston-launched 1.17.1 item. The launch state is modeled as\nvx=1 after PistonMovingBlockEntity collides with a moving slime block. Candidates must enter a\n2gt-per-block cadence by <=5gt and keep a long-run 0.5 m/gt average.".to_string()
+    [
+        "Usage:",
+        "  cargo run --release -- verify <projection.litematic> --x 0.125 --y 1.0 --z 1.0 --vx 1.0 --vy 0.0 --vz 0.0 --ticks 200",
+        "  cargo run --release -- search [--effort fast|balanced|deep] [--top 20]",
+        "  cargo run --release -- [legacy search flags]",
+        "",
+        "verify:",
+        "  Load a .litematic world, simulate one entity state in 3D, and write per-tick CSV/JSON output.",
+        "  Required inputs are the schematic plus x/y/z and vx/vy/vz. Optional advanced flags: --width,",
+        "  --height, --entity-id-mod4, --initial-tick-count, and --target-speed.",
+        "",
+        "legacy search:",
+        "  Searches transition prefixes for a slime-piston-launched 1.17.1 item. The launch state is modeled as",
+        "  vx=1 after PistonMovingBlockEntity collides with a moving slime block. Candidates must enter a",
+        "  2gt-per-block cadence by <=5gt and keep a long-run 0.5 m/gt average.",
+    ]
+    .join("\n")
 }
 
-pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
-    let mut args = Args {
+fn default_legacy_args() -> Args {
+    Args {
         out: PathBuf::from("artifacts").join("item-waterway-launch-search"),
         mode: Mode::Full,
         ticks: 500,
@@ -520,18 +590,80 @@ pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
         dedupe_long: true,
         full_cadence_pairs: 3000,
         full_cadence_tolerance: 0.05,
+        target_distance: 1,
+        target_ticks: 2,
+        target_speed: 0.5,
         fixed_start_offsets: None,
         start_y: 0.0,
         start_vx: 1.0,
         start_vy: 0.0,
         start_on_ground: true,
-    };
+    }
+}
 
+fn parse_bool(text: &str, flag: &str) -> Result<bool, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{} must be true or false.", flag)),
+    }
+}
+
+fn approximate_target_cadence(target_speed: f64) -> Result<(usize, usize, f64), String> {
+    if !(target_speed.is_finite() && target_speed > 0.0) {
+        return Err("--target-speed must be a finite positive number.".to_string());
+    }
+    let mut best: Option<(usize, usize, f64)> = None;
+    let mut best_error = f64::INFINITY;
+    for ticks in 1..=12 {
+        for distance in 1..=12 {
+            let speed = distance as f64 / ticks as f64;
+            let error = (speed - target_speed).abs();
+            if error < best_error
+                || (error == best_error
+                    && best
+                        .map(|(best_distance, best_ticks, _)| {
+                            ticks < best_ticks || (ticks == best_ticks && distance < best_distance)
+                        })
+                        .unwrap_or(true))
+            {
+                best_error = error;
+                best = Some((distance, ticks, speed));
+            }
+        }
+    }
+    best.ok_or_else(|| "Failed to resolve target cadence.".to_string())
+}
+
+fn resolve_target_cadence(
+    target_speed: Option<f64>,
+    target_distance: Option<usize>,
+    target_ticks: Option<usize>,
+) -> Result<(usize, usize, f64), String> {
+    match (target_distance, target_ticks) {
+        (Some(distance), Some(ticks)) => {
+            if ticks == 0 || distance == 0 {
+                return Err("--target-distance and --target-ticks must be >= 1.".to_string());
+            }
+            Ok((distance, ticks, distance as f64 / ticks as f64))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Err("--target-distance and --target-ticks must be provided together.".to_string())
+        }
+        (None, None) => approximate_target_cadence(target_speed.unwrap_or(0.5)),
+    }
+}
+
+fn parse_legacy_args(argv: &[String]) -> Result<Args, String> {
+    let mut args = default_legacy_args();
+    let mut parsed_target_speed = None;
+    let mut parsed_target_distance = None;
+    let mut parsed_target_ticks = None;
     let mut i = 0;
     while i < argv.len() {
         let arg = &argv[i];
         if arg == "--help" || arg == "-h" {
-            return Ok(ParsedArgs::Help(usage()));
+            return Err(usage());
         }
         let next = |index: &mut usize| -> Result<&str, String> {
             *index += 1;
@@ -563,18 +695,13 @@ pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
                 args.start_samples = parse_usize(next(&mut i)?, "--start-samples")?
             }
             "--fixed-start-offsets" => {
-                let values = parse_number_list(next(&mut i)?);
-                args.fixed_start_offsets = Some(values);
+                args.fixed_start_offsets = Some(parse_number_list(next(&mut i)?))
             }
             "--start-y" => args.start_y = parse_f64(next(&mut i)?, "--start-y")?,
             "--start-vx" => args.start_vx = parse_f64(next(&mut i)?, "--start-vx")?,
             "--start-vy" => args.start_vy = parse_f64(next(&mut i)?, "--start-vy")?,
             "--start-on-ground" => {
-                args.start_on_ground = match next(&mut i)?.to_ascii_lowercase().as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err("--start-on-ground must be true or false.".to_string()),
-                }
+                args.start_on_ground = parse_bool(next(&mut i)?, "--start-on-ground")?
             }
             "--keep-weak" => args.keep_weak = true,
             "--min-early-block-hit-rate" => {
@@ -590,17 +717,38 @@ pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
             "--full-cadence-tolerance" => {
                 args.full_cadence_tolerance = parse_f64(next(&mut i)?, "--full-cadence-tolerance")?
             }
+            "--target-speed" => {
+                parsed_target_speed = Some(parse_f64(next(&mut i)?, "--target-speed")?)
+            }
+            "--target-distance" => {
+                parsed_target_distance = Some(parse_usize(next(&mut i)?, "--target-distance")?)
+            }
+            "--target-ticks" => {
+                parsed_target_ticks = Some(parse_usize(next(&mut i)?, "--target-ticks")?)
+            }
             _ => return Err(format!("Unknown argument: {}\n{}", arg, usage())),
         }
         i += 1;
     }
 
-    let minimum_early_ticks = 5 + args.cadence_pairs * 2 + 4;
+    let (target_distance, target_ticks, target_speed) = resolve_target_cadence(
+        parsed_target_speed,
+        parsed_target_distance,
+        parsed_target_ticks,
+    )?;
+    args.target_distance = target_distance;
+    args.target_ticks = target_ticks;
+    args.target_speed = target_speed;
+
+    let minimum_early_ticks = 5 + args.cadence_pairs * args.target_ticks + 4;
     if args.ticks < minimum_early_ticks {
         match args.mode {
             Mode::Early => args.ticks = minimum_early_ticks,
             Mode::Full => {
-                return Err("--ticks must be at least 5 + --cadence-pairs * 2 + 4.".to_string());
+                return Err(format!(
+                    "--ticks must be at least 5 + --cadence-pairs * {} + 4.",
+                    args.target_ticks
+                ));
             }
         }
     }
@@ -633,9 +781,256 @@ pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
         return Err("--full-cadence-tolerance must be >= 0.".to_string());
     }
     if matches!(args.mode, Mode::Full) {
-        args.ticks = args.ticks.max(5 + args.full_cadence_pairs * 2 + 4);
+        args.ticks = args
+            .ticks
+            .max(5 + args.full_cadence_pairs * args.target_ticks + 4);
     }
-    Ok(ParsedArgs::Run(args))
+    Ok(args)
+}
+
+fn parse_search_args(argv: &[String]) -> Result<SearchCommand, String> {
+    let mut command = SearchCommand {
+        out: PathBuf::from("artifacts").join("item-waterway-search"),
+        top: 20,
+        target_speed: 0.5,
+        effort: EffortPreset::Balanced,
+        export_cycles: 12,
+        export_top_count: 1,
+        start_y: 0.0,
+        start_vx: 1.0,
+        start_vy: 0.0,
+        start_on_ground: true,
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        let next = |index: &mut usize| -> Result<&str, String> {
+            *index += 1;
+            argv.get(*index)
+                .map(|value| value.as_str())
+                .ok_or_else(|| format!("Missing value for {}", arg))
+        };
+        match arg.as_str() {
+            "--out" => command.out = PathBuf::from(next(&mut i)?),
+            "--top" => command.top = parse_usize(next(&mut i)?, "--top")?,
+            "--target-speed" => command.target_speed = parse_f64(next(&mut i)?, "--target-speed")?,
+            "--effort" => {
+                command.effort = match next(&mut i)? {
+                    "fast" => EffortPreset::Fast,
+                    "balanced" => EffortPreset::Balanced,
+                    "deep" => EffortPreset::Deep,
+                    _ => return Err("--effort must be fast, balanced, or deep.".to_string()),
+                }
+            }
+            "--export-cycles" => {
+                command.export_cycles = parse_usize(next(&mut i)?, "--export-cycles")?
+            }
+            "--export-top-count" => {
+                command.export_top_count = parse_usize(next(&mut i)?, "--export-top-count")?
+            }
+            "--start-y" => command.start_y = parse_f64(next(&mut i)?, "--start-y")?,
+            "--start-vx" => command.start_vx = parse_f64(next(&mut i)?, "--start-vx")?,
+            "--start-vy" => command.start_vy = parse_f64(next(&mut i)?, "--start-vy")?,
+            "--start-on-ground" => {
+                command.start_on_ground = parse_bool(next(&mut i)?, "--start-on-ground")?
+            }
+            "--help" | "-h" => return Ok(command),
+            _ => return Err(format!("Unknown argument for search: {arg}")),
+        }
+        i += 1;
+    }
+    Ok(command)
+}
+
+fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
+    let mut command = VerifyCommand {
+        input: PathBuf::new(),
+        out: PathBuf::from("artifacts").join("item-waterway-verify"),
+        target_speed: 0.5,
+        ticks: 240,
+        inspect_tick: None,
+        start_x: 0.125,
+        start_y: 1.0,
+        start_z: 1.0,
+        start_vx: 1.0,
+        start_vy: 0.0,
+        start_vz: 0.0,
+        start_on_ground: true,
+        width: VERIFY_DEFAULT_WIDTH,
+        height: VERIFY_DEFAULT_HEIGHT,
+        entity_id_mod4: 0,
+        initial_tick_count: 0,
+    };
+    let mut positional_input: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        let next = |index: &mut usize| -> Result<&str, String> {
+            *index += 1;
+            argv.get(*index)
+                .map(|value| value.as_str())
+                .ok_or_else(|| format!("Missing value for {}", arg))
+        };
+        match arg.as_str() {
+            "--input" => command.input = PathBuf::from(next(&mut i)?),
+            "--out" => command.out = PathBuf::from(next(&mut i)?),
+            "--target-speed" => command.target_speed = parse_f64(next(&mut i)?, "--target-speed")?,
+            "--ticks" => command.ticks = parse_usize(next(&mut i)?, "--ticks")?,
+            "--tick" => command.inspect_tick = Some(parse_usize(next(&mut i)?, "--tick")?),
+            "--x" => command.start_x = parse_f64(next(&mut i)?, "--x")?,
+            "--y" => command.start_y = parse_f64(next(&mut i)?, "--y")?,
+            "--z" => command.start_z = parse_f64(next(&mut i)?, "--z")?,
+            "--vx" => command.start_vx = parse_f64(next(&mut i)?, "--vx")?,
+            "--vy" => command.start_vy = parse_f64(next(&mut i)?, "--vy")?,
+            "--vz" => command.start_vz = parse_f64(next(&mut i)?, "--vz")?,
+            "--start-on-ground" => {
+                command.start_on_ground = parse_bool(next(&mut i)?, "--start-on-ground")?
+            }
+            "--width" => command.width = parse_f64(next(&mut i)?, "--width")?,
+            "--height" => command.height = parse_f64(next(&mut i)?, "--height")?,
+            "--entity-id-mod4" => {
+                command.entity_id_mod4 = parse_usize(next(&mut i)?, "--entity-id-mod4")?
+            }
+            "--initial-tick-count" => {
+                command.initial_tick_count = parse_usize(next(&mut i)?, "--initial-tick-count")?
+            }
+            "--help" | "-h" => return Ok(command),
+            other if other.starts_with('-') => {
+                return Err(format!("Unknown argument for verify: {other}"));
+            }
+            other => {
+                if positional_input.is_none() {
+                    positional_input = Some(PathBuf::from(other));
+                } else {
+                    return Err(format!("Unexpected positional argument: {other}"));
+                }
+            }
+        }
+        i += 1;
+    }
+    if command.input.as_os_str().is_empty() {
+        command.input = positional_input.ok_or_else(|| {
+            "verify requires a .litematic input. Pass it as the first positional argument or with --input.".to_string()
+        })?;
+    }
+    if !(command.target_speed.is_finite() && command.target_speed > 0.0) {
+        return Err("--target-speed must be a finite positive number.".to_string());
+    }
+    if !(command.width.is_finite() && command.width > AABB_DEFLATE * 2.0) {
+        return Err("--width must be finite and greater than 0.002.".to_string());
+    }
+    if !(command.height.is_finite() && command.height > AABB_DEFLATE * 2.0) {
+        return Err("--height must be finite and greater than 0.002.".to_string());
+    }
+    if command.entity_id_mod4 > 3 {
+        return Err("--entity-id-mod4 must be in [0, 3].".to_string());
+    }
+    Ok(command)
+}
+
+fn search_command_to_args(command: &SearchCommand) -> Result<Args, String> {
+    let mut args = default_legacy_args();
+    args.out = command.out.clone();
+    args.top = command.top;
+    args.start_y = command.start_y;
+    args.start_vx = command.start_vx;
+    args.start_vy = command.start_vy;
+    args.start_on_ground = command.start_on_ground;
+    let (target_distance, target_ticks, target_speed) =
+        resolve_target_cadence(Some(command.target_speed), None, None)?;
+    args.target_distance = target_distance;
+    args.target_ticks = target_ticks;
+    args.target_speed = target_speed;
+    match command.effort {
+        EffortPreset::Fast => {
+            args.ticks = 180;
+            args.top = args.top.min(20);
+            args.max_prefix = 4;
+            args.cadence_pairs = 6;
+            args.long_window = 80;
+            args.start_samples = 9;
+            args.early_limit = 400;
+            args.long_limit = 60;
+            args.full_cadence_pairs = 400;
+        }
+        EffortPreset::Balanced => {
+            args.ticks = 320;
+            args.max_prefix = 5;
+            args.cadence_pairs = 10;
+            args.long_window = 120;
+            args.start_samples = 17;
+            args.early_limit = 1200;
+            args.long_limit = 150;
+            args.full_cadence_pairs = 900;
+        }
+        EffortPreset::Deep => {
+            args.ticks = 520;
+            args.max_prefix = 6;
+            args.cadence_pairs = 14;
+            args.long_window = 200;
+            args.start_samples = 25;
+            args.early_limit = 4000;
+            args.long_limit = 400;
+            args.full_cadence_pairs = 1800;
+        }
+    }
+    Ok(args)
+}
+
+pub fn parse_args(argv: &[String]) -> Result<ParsedArgs, String> {
+    if argv.is_empty() {
+        return Ok(ParsedArgs::Help(usage()));
+    }
+    if matches!(argv[0].as_str(), "--help" | "-h" | "help") {
+        return Ok(ParsedArgs::Help(usage()));
+    }
+    match argv[0].as_str() {
+        "verify"
+            if argv
+                .get(1)
+                .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
+        {
+            Ok(ParsedArgs::Help(usage()))
+        }
+        "search"
+            if argv
+                .get(1)
+                .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
+        {
+            Ok(ParsedArgs::Help(usage()))
+        }
+        "verify" => Ok(ParsedArgs::Verify(parse_verify_args(&argv[1..])?)),
+        "search" => Ok(ParsedArgs::Search(parse_search_args(&argv[1..])?)),
+        _ => Ok(ParsedArgs::Run(parse_legacy_args(argv)?)),
+    }
+}
+
+fn run_search_outputs(args: &Args) -> Result<SearchPayload, String> {
+    fs::create_dir_all(&args.out)
+        .map_err(|error| format!("Failed to create output dir: {error}"))?;
+    let payload = search(args);
+    let csv_path = args.out.join("launch-search-results.csv");
+    let md_path = args.out.join("launch-search-summary.md");
+    let json_path = args.out.join("launch-top-candidates.json");
+    write_csv(&csv_path, &payload.results)?;
+    write_summary(&md_path, &payload, args)?;
+    write_json(&json_path, &payload, args)?;
+    println!("Evaluated {} launch states.", payload.evaluated);
+    println!("Kept {} candidates.", payload.results.len());
+    println!("CSV: {}", csv_path.display());
+    println!("Markdown: {}", md_path.display());
+    println!("JSON: {}", json_path.display());
+    println!();
+    let rows = &payload.results[..payload.results.len().min(args.top.min(20))];
+    println!(
+        "{}",
+        if matches!(args.mode, Mode::Early) {
+            markdown_early_table(rows)
+        } else {
+            markdown_table(rows)
+        }
+    );
+    Ok(payload)
 }
 
 pub fn main_cli(argv: Vec<String>) -> Result<(), String> {
@@ -646,32 +1041,15 @@ pub fn main_cli(argv: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         ParsedArgs::Run(args) => {
-            fs::create_dir_all(&args.out)
-                .map_err(|error| format!("Failed to create output dir: {error}"))?;
-            let payload = search(&args);
-            let csv_path = args.out.join("launch-search-results.csv");
-            let md_path = args.out.join("launch-search-summary.md");
-            let json_path = args.out.join("launch-top-candidates.json");
-            write_csv(&csv_path, &payload.results)?;
-            write_summary(&md_path, &payload, &args)?;
-            write_json(&json_path, &payload, &args)?;
-            println!("Evaluated {} launch states.", payload.evaluated);
-            println!("Kept {} candidates.", payload.results.len());
-            println!("CSV: {}", csv_path.display());
-            println!("Markdown: {}", md_path.display());
-            println!("JSON: {}", json_path.display());
-            println!();
-            let rows = &payload.results[..payload.results.len().min(args.top.min(20))];
-            println!(
-                "{}",
-                if matches!(args.mode, Mode::Early) {
-                    markdown_early_table(rows)
-                } else {
-                    markdown_table(rows)
-                }
-            );
+            run_search_outputs(&args)?;
             Ok(())
         }
+        ParsedArgs::Search(command) => {
+            let args = search_command_to_args(&command)?;
+            let _ = run_search_outputs(&args)?;
+            Ok(())
+        }
+        ParsedArgs::Verify(command) => run_verify_command(&command),
     }
 }
 
@@ -2408,6 +2786,9 @@ mod tests {
             dedupe_long: true,
             full_cadence_pairs: 4,
             full_cadence_tolerance: 0.05,
+            target_distance: 1,
+            target_ticks: 2,
+            target_speed: 0.5,
             fixed_start_offsets: None,
             start_y: 0.0,
             start_vx: 1.0,
