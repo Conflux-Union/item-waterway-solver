@@ -1013,6 +1013,12 @@ fn simulate(world: &LoadedSchematic, command: &VerifyCommand) -> Vec<VerifyTickR
                 collided_x = move_result.collided_x;
                 collided_y = move_result.collided_y;
                 collided_z = move_result.collided_z;
+                if collided_x {
+                    vel.x = 0.0;
+                }
+                if collided_z {
+                    vel.z = 0.0;
+                }
                 landed = move_result.collided_y && vel.y < 0.0;
                 actual_on_ground = landed;
             }
@@ -2598,6 +2604,59 @@ mod tests {
 
         let trailing_source = block_at(&region, [12, 1, 1]).expect("trailing source");
         assert_eq!(block_full_id(trailing_source), "minecraft:water");
+    }
+
+    #[test]
+    fn verify_matches_vanilla_connected_bars_collision_tick() {
+        let mut region = region_with_shape([7, 4, 3]);
+        for x in 0..=6 {
+            for z in 0..=2 {
+                region
+                    .set_block([x, 0, z], &parse_block("minecraft:smooth_stone"))
+                    .unwrap();
+            }
+        }
+        region
+            .set_block(
+                [3, 1, 1],
+                &parse_block("minecraft:iron_bars[north=true,south=true,east=false,west=false]"),
+            )
+            .unwrap();
+        let world = LoadedSchematic {
+            name: "connected-bars-collision".to_string(),
+            region,
+            approximate_collision_blocks: Vec::new(),
+        };
+        let command = VerifyCommand {
+            input: std::path::PathBuf::from("connected-bars-collision.litematic"),
+            out: std::path::PathBuf::from("artifacts/test"),
+            target_speed: 0.0,
+            ticks: 1,
+            inspect_tick: Some(1),
+            start_x: 2.5,
+            start_y: 1.2,
+            start_z: 1.5,
+            start_vx: 1.0,
+            start_vy: 0.0,
+            start_vz: 0.0,
+            start_on_ground: false,
+            width: VERIFY_DEFAULT_WIDTH,
+            height: VERIFY_DEFAULT_HEIGHT,
+            entity_id_mod4: 0,
+            initial_tick_count: 0,
+        };
+
+        let rows = simulate(&world, &command);
+        let tick = &rows[1];
+        assert!((tick.x - 3.3125).abs() < 1.0e-12);
+        assert!((tick.y - 1.16).abs() < 1.0e-12);
+        assert!((tick.z - 1.5).abs() < 1.0e-12);
+        assert!((tick.vx - 0.0).abs() < 1.0e-12);
+        assert!((tick.vy + 0.03920000076293945).abs() < 1.0e-12);
+        assert!((tick.vz - 0.0).abs() < 1.0e-12);
+        assert!(tick.collided_x);
+        assert!(!tick.collided_z);
+        assert!(!tick.on_ground);
     }
 
     #[test]
