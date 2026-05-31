@@ -194,8 +194,25 @@ impl DynamicFluidTicks {
             for y in 0..shape[1] {
                 for z in 0..shape[2] {
                     let pos = [x, y, z];
-                    if dynamic_water_state_at(region, pos).is_some() {
-                        ticks.schedule(FLOWING_WATER_TICK_DELAY, pos);
+                    if let Some(fluid) = dynamic_water_state_at(region, pos) {
+                        let should_schedule = !fluid.is_source()
+                            || [
+                                [0, -1, 0],
+                                [0, 1, 0],
+                                [-1, 0, 0],
+                                [1, 0, 0],
+                                [0, 0, -1],
+                                [0, 0, 1],
+                            ]
+                            .into_iter()
+                            .any(|offset| {
+                                dynamic_water_state_at(region, offset_pos(pos, offset))
+                                    .map(|neighbor| !neighbor.is_source())
+                                    .unwrap_or(false)
+                            });
+                        if should_schedule {
+                            ticks.schedule(FLOWING_WATER_TICK_DELAY, pos);
+                        }
                     }
                 }
             }
@@ -325,11 +342,13 @@ impl DynamicFluidTicks {
         &mut self,
         region: &mut Region,
         pos: [i32; 3],
-        _state: &Block,
+        state: &Block,
         fluid: DynamicWaterState,
         tick: usize,
     ) {
-        set_water_block(region, pos, fluid);
+        if !try_place_waterlogged_block(region, pos, state) {
+            set_water_block(region, pos, fluid);
+        }
         self.schedule_neighbors(tick + FLOWING_WATER_TICK_DELAY, pos);
     }
 }
@@ -638,7 +657,53 @@ fn water_at_single_block(block: &Block) -> Option<WaterCell> {
 
     None
 }
+
+fn is_waterloggable_block(block: &Block) -> bool {
+    block.namespace == "minecraft"
+        && (block.id.ends_with("slab")
+            || block.id.ends_with("stairs")
+            || block.id.ends_with("trapdoor")
+            || block.id.ends_with("fence")
+            || block.id.ends_with("pane")
+            || block.id.ends_with("bars")
+            || block.id.ends_with("wall"))
+        && !block.id.ends_with("fence_gate")
+        && !block.id.ends_with("door")
+}
+
+fn slab_is_double(block: &Block) -> bool {
+    block.id.ends_with("slab") && block.attributes.get("type").map(String::as_str) == Some("double")
+}
+
+fn is_waterlogged(block: &Block) -> bool {
+    block.attributes.get("waterlogged").map(String::as_str) == Some("true")
+}
+
+fn with_waterlogged(block: &Block, waterlogged: bool) -> Block {
+    let mut updated = block.clone();
+    updated.attributes.insert(
+        "waterlogged".to_string(),
+        if waterlogged { "true" } else { "false" }.to_string(),
+    );
+    updated
+}
+
+fn try_place_waterlogged_block(region: &mut Region, pos: [i32; 3], block: &Block) -> bool {
+    if !can_place_water_in_block(block) {
+        return false;
+    }
+    let updated = with_waterlogged(block, true);
+    let _ = region.set_block(pos, &updated);
+    true
+}
+
+fn can_place_water_in_block(block: &Block) -> bool {
+    is_waterloggable_block(block) && !is_waterlogged(block) && !slab_is_double(block)
+}
 fn can_hold_any_fluid(block: &Block) -> bool {
+    if is_waterloggable_block(block) {
+        return true;
+    }
     if fluid_blocks_motion(block) {
         return false;
     }
@@ -655,8 +720,8 @@ fn can_hold_any_fluid(block: &Block) -> bool {
         && !block.id.ends_with("sign")
 }
 
-fn can_hold_specific_fluid(_block: &Block) -> bool {
-    true
+fn can_hold_specific_fluid(block: &Block) -> bool {
+    !is_waterloggable_block(block) || can_place_water_in_block(block)
 }
 
 fn can_pass_through_wall(
@@ -2058,6 +2123,72 @@ mod tests {
         }
     }
 
+    fn waterlogged_static_world() -> LoadedSchematic {
+        let mut region = region_with_shape([14, 5, 3]);
+        region.name = "waterlogged_static".to_string();
+
+        for x in 1..=12 {
+            region
+                .set_block([x, 0, 0], &parse_block("minecraft:smooth_stone"))
+                .unwrap();
+            region
+                .set_block([x, 0, 1], &parse_block("minecraft:smooth_stone"))
+                .unwrap();
+            region
+                .set_block([x, 0, 2], &parse_block("minecraft:smooth_stone"))
+                .unwrap();
+            for y in 1..=3 {
+                region
+                    .set_block([x, y, 0], &parse_block("minecraft:glass"))
+                    .unwrap();
+                region
+                    .set_block([x, y, 2], &parse_block("minecraft:glass"))
+                    .unwrap();
+            }
+            for z in 0..=2 {
+                region
+                    .set_block([x, 4, z], &parse_block("minecraft:glass"))
+                    .unwrap();
+            }
+        }
+
+        for y in 1..=3 {
+            for z in 0..=2 {
+                region
+                    .set_block([0, y, z], &parse_block("minecraft:glass"))
+                    .unwrap();
+                region
+                    .set_block([13, y, z], &parse_block("minecraft:glass"))
+                    .unwrap();
+            }
+        }
+
+        for (x, block) in [
+            (1, "minecraft:water"),
+            (2, "minecraft:oak_slab[type=bottom]"),
+            (4, "minecraft:cobblestone_wall"),
+            (6, "minecraft:iron_bars"),
+            (
+                8,
+                "minecraft:oak_trapdoor[half=bottom,open=true,facing=north]",
+            ),
+            (
+                10,
+                "minecraft:oak_stairs[facing=east,half=bottom,shape=straight]",
+            ),
+            (11, "minecraft:water[level=1]"),
+            (12, "minecraft:water"),
+        ] {
+            region.set_block([x, 1, 1], &parse_block(block)).unwrap();
+        }
+
+        LoadedSchematic {
+            name: "waterlogged-static".to_string(),
+            region,
+            approximate_collision_blocks: Vec::new(),
+        }
+    }
+
     fn run_fluid_ticks(region: &mut Region, ticks: usize) {
         let mut fluid_ticks = DynamicFluidTicks::bootstrap(region);
         for tick in 1..=ticks {
@@ -2282,6 +2413,50 @@ mod tests {
     }
 
     #[test]
+    fn spread_to_waterloggable_block_keeps_block_and_sets_waterlogged() {
+        let mut region = region_with_shape([1, 1, 1]);
+        let slab = parse_block("minecraft:oak_slab[type=bottom]");
+        region.set_block([0, 0, 0], &slab).unwrap();
+        let mut fluid_ticks = DynamicFluidTicks::default();
+        fluid_ticks.spread_to(
+            &mut region,
+            [0, 0, 0],
+            &slab,
+            DynamicWaterState {
+                amount: 8,
+                falling: false,
+            },
+            0,
+        );
+        let block = block_at(&region, [0, 0, 0]).expect("waterlogged slab");
+        assert_eq!(block.id, "oak_slab");
+        assert_eq!(
+            block.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn spread_to_double_slab_replaces_with_water_block() {
+        let mut region = region_with_shape([1, 1, 1]);
+        let slab = parse_block("minecraft:oak_slab[type=double]");
+        region.set_block([0, 0, 0], &slab).unwrap();
+        let mut fluid_ticks = DynamicFluidTicks::default();
+        fluid_ticks.spread_to(
+            &mut region,
+            [0, 0, 0],
+            &slab,
+            DynamicWaterState {
+                amount: 8,
+                falling: false,
+            },
+            0,
+        );
+        let block = block_at(&region, [0, 0, 0]).expect("water block");
+        assert_eq!(block.id, "water");
+    }
+
+    #[test]
     fn complex_static_gate_fluid_ticks_match_vanilla_lane40_snapshot() {
         let world = complex_static_gate_world();
         let mut region = world.region.clone();
@@ -2360,6 +2535,69 @@ mod tests {
         assert!((tick80.y - 1.0362779907672022).abs() < 1.0e-12);
         assert!((tick80.vx + 0.13993332005607179).abs() < epsilon_vx);
         assert!((tick80.vy - 0.0052744411615881165).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn waterlogged_static_lane_matches_vanilla_snapshot() {
+        let world = waterlogged_static_world();
+        let mut region = world.region.clone();
+        run_fluid_ticks(&mut region, 40);
+
+        let source = block_at(&region, [1, 1, 1]).expect("source water");
+        assert_eq!(block_full_id(source), "minecraft:water");
+
+        let slab = block_at(&region, [2, 1, 1]).expect("slab");
+        assert_eq!(slab.id, "oak_slab");
+        assert_ne!(
+            slab.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+
+        let air_after_slab = block_at(&region, [3, 1, 1]).expect("air after slab");
+        assert!(air_after_slab.is_air());
+
+        let wall = block_at(&region, [4, 1, 1]).expect("wall");
+        assert_eq!(wall.id, "cobblestone_wall");
+        assert_ne!(
+            wall.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+
+        let air_after_wall = block_at(&region, [5, 1, 1]).expect("air after wall");
+        assert!(air_after_wall.is_air());
+
+        let bars = block_at(&region, [6, 1, 1]).expect("iron bars");
+        assert_eq!(bars.id, "iron_bars");
+        assert_ne!(
+            bars.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+
+        let air_after_bars = block_at(&region, [7, 1, 1]).expect("air after bars");
+        assert!(air_after_bars.is_air());
+
+        let trapdoor = block_at(&region, [8, 1, 1]).expect("trapdoor");
+        assert_eq!(trapdoor.id, "oak_trapdoor");
+        assert_ne!(
+            trapdoor.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+
+        let air_after_trapdoor = block_at(&region, [9, 1, 1]).expect("air after trapdoor");
+        assert!(air_after_trapdoor.is_air());
+
+        let stairs = block_at(&region, [10, 1, 1]).expect("stairs");
+        assert_eq!(stairs.id, "oak_stairs");
+        assert_ne!(
+            stairs.attributes.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+
+        let trailing_flow = block_at(&region, [11, 1, 1]).expect("trailing flow");
+        assert_eq!(block_full_id(trailing_flow), "minecraft:water[level=1]");
+
+        let trailing_source = block_at(&region, [12, 1, 1]).expect("trailing source");
+        assert_eq!(block_full_id(trailing_source), "minecraft:water");
     }
 
     #[test]
