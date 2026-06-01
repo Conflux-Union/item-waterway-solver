@@ -1,0 +1,11 @@
+# Probe a passive living-physics carrier inside a ladder cell for one tick.
+# Armor stand avoids mob AI noise while still using LivingEntity movement code.
+tick freeze
+kill @e[type=minecraft:armor_stand,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+setblock 1 65 1 ladder[facing=north]
+summon armor_stand 1.5 65.2 1.5 {Tags:["codex_probe"],NoGravity:0b,Motion:[0.0d,-1.0d,0.0d]}
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]

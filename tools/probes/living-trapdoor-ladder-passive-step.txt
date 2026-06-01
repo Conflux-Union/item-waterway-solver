@@ -1,0 +1,12 @@
+# Probe a passive living-physics carrier inside an open trapdoor sitting above
+# a matching ladder. Vanilla treats this as climbable.
+tick freeze
+kill @e[type=minecraft:armor_stand,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+setblock 1 64 1 ladder[facing=north]
+setblock 1 65 1 oak_trapdoor[facing=north,half=bottom,open=true,waterlogged=false]
+summon armor_stand 1.5 65.2 1.5 {Tags:["codex_probe"],NoGravity:0b,Motion:[0.0d,-1.0d,0.0d]}
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]

@@ -1,0 +1,9 @@
+# Probe a passive living-like physics carrier in full lava.
+tick freeze
+kill @e[type=minecraft:armor_stand]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+setblock 1 64 1 lava
+summon armor_stand 1.5 64.0 1.5 {NoGravity:0b}
+tick step 1
+data get entity @e[type=minecraft:armor_stand,limit=1,sort=nearest]

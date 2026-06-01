@@ -1,0 +1,10 @@
+# Probe item bounce on a slime block in a single tick.
+tick freeze
+kill @e[type=minecraft:item,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 67 2 air
+setblock 1 64 1 slime_block
+summon item 1.5 65.2 1.5 {Tags:["codex_probe"],PickupDelay:32767,Age:0s,Item:{id:"minecraft:stone",count:1},Motion:[0.0d,-1.0d,0.0d]}
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]

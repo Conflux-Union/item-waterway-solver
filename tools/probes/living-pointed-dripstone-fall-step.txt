@@ -1,0 +1,10 @@
+# Probe a living entity falling onto an upward pointed dripstone tip for one tick.
+tick freeze
+kill @e[type=minecraft:armor_stand]
+forceload add 0 0
+fill 0 63 0 2 66 2 air
+setblock 1 63 1 pointed_dripstone[thickness=tip,vertical_direction=up,waterlogged=false]
+summon armor_stand 1.5 65.0 1.5 {NoGravity:0b,Motion:[0.0d,-1.5d,0.0d],Health:10.0f}
+data get entity @e[type=minecraft:armor_stand,limit=1,sort=nearest]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,limit=1,sort=nearest]

@@ -1,0 +1,11 @@
+# Probe item inside an upward bubble column with another bubble column above.
+tick freeze
+kill @e[type=minecraft:item,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+setblock 1 64 1 bubble_column[drag=false]
+setblock 1 65 1 bubble_column[drag=false]
+summon item 1.5 64.0 1.5 {Tags:["codex_probe"],PickupDelay:32767,Age:0s,Item:{id:"minecraft:stone",count:1},Motion:[0.0d,0.0d,0.0d]}
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]

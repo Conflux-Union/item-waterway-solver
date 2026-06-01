@@ -1,0 +1,12 @@
+# Probe a physics-active living entity without mob AI pressure via armor stand.
+# Expected vanilla result after one tick in a source-water cell:
+# position unchanged, Motion.y = -0.005.
+tick freeze
+kill @e[type=minecraft:armor_stand,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+setblock 1 64 1 water
+summon armor_stand 1.5 64.0 1.5 {Tags:["codex_probe"],NoGravity:0b}
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]

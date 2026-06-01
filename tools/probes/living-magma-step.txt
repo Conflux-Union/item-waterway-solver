@@ -1,0 +1,10 @@
+# Probe a physics-active living entity stepping across magma for one tick.
+tick freeze
+kill @e[type=minecraft:armor_stand]
+forceload add 0 0
+fill 0 63 0 2 66 2 air
+fill 0 63 0 2 63 2 magma_block
+summon armor_stand 1.5 64.0 1.5 {NoGravity:0b,Motion:[0.01d,0.0d,0.0d],Health:10.0f}
+data get entity @e[type=minecraft:armor_stand,limit=1,sort=nearest]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,limit=1,sort=nearest]

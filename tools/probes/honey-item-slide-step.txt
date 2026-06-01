@@ -1,0 +1,10 @@
+# Probe item honey slide on the east face of a honey block.
+tick freeze
+kill @e[type=minecraft:item,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 4 67 1 air
+setblock 1 64 0 honey_block
+summon item 2.07 64.5 0.5 {Tags:["codex_probe"],PickupDelay:32767,Age:0s,Item:{id:"minecraft:stone",count:1},Motion:[0.0d,-0.2d,0.3d]}
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:item,tag=codex_probe,limit=1]

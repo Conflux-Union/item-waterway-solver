@@ -1,0 +1,12 @@
+# Probe jumpOutOfFluid with diagonal movement that leaves the water cell while
+# still colliding horizontally on the other axis.
+tick freeze
+kill @e[type=minecraft:armor_stand,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 4 68 3 air
+setblock 1 64 1 water
+setblock 1 64 2 stone
+summon armor_stand 1.75 64.0 1.75 {Tags:["codex_probe"],NoGravity:0b,Motion:[1.0d,0.0d,1.0d]}
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:armor_stand,tag=codex_probe,limit=1]

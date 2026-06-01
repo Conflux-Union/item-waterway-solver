@@ -1,0 +1,10 @@
+# Probe a living entity intersecting a lit campfire, then advance exactly one tick.
+tick freeze
+kill @e[type=minecraft:pig,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 66 2 air
+setblock 1 63 1 campfire[lit=true,signal_fire=false,waterlogged=false,facing=north]
+summon pig 1.5 63.2 1.5 {NoAI:1b,Tags:["codex_probe"]}
+data get entity @e[type=minecraft:pig,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:pig,tag=codex_probe,limit=1]

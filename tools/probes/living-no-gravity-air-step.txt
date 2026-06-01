@@ -1,0 +1,10 @@
+# Probe a no-ai, no-gravity living entity in air.
+# Expected vanilla result after one tick: position unchanged, motion unchanged.
+tick freeze
+kill @e[type=minecraft:pig,tag=codex_probe]
+forceload add 0 0
+fill 0 63 0 2 68 2 air
+summon pig 1.5 65.0 1.5 {Tags:["codex_probe"],NoAI:1b,NoGravity:1b}
+data get entity @e[type=minecraft:pig,tag=codex_probe,limit=1]
+tick step 1
+data get entity @e[type=minecraft:pig,tag=codex_probe,limit=1]

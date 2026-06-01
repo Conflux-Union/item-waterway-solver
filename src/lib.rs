@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 mod litematic;
 mod verify;
 use verify::run_verify_command;
@@ -13,6 +14,14 @@ const WIDTH: f64 = 0.25;
 const HEIGHT: f64 = 0.25;
 pub(crate) const VERIFY_DEFAULT_WIDTH: f64 = WIDTH;
 pub(crate) const VERIFY_DEFAULT_HEIGHT: f64 = HEIGHT;
+pub(crate) const VERIFY_ARMOR_STAND_WIDTH: f64 = 0.5;
+pub(crate) const VERIFY_ARMOR_STAND_HEIGHT: f64 = 1.975;
+pub(crate) const VERIFY_PIG_WIDTH: f64 = 0.9;
+pub(crate) const VERIFY_PIG_HEIGHT: f64 = 0.9;
+pub(crate) const VERIFY_FALLING_BLOCK_WIDTH: f64 = 0.98;
+pub(crate) const VERIFY_FALLING_BLOCK_HEIGHT: f64 = 0.98;
+pub(crate) const VERIFY_GENERIC_WIDTH: f64 = 0.6;
+pub(crate) const VERIFY_GENERIC_HEIGHT: f64 = 1.8;
 const FLUID_MOVEMENT_THRESHOLD: f64 = 0.1;
 const WATER_PUSH: f64 = 0.014;
 const HORIZONTAL_WATER_DAMPING: f64 = 0.99_f32 as f64;
@@ -44,6 +53,25 @@ pub enum EffortPreset {
     Fast,
     Balanced,
     Deep,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyEntityKind {
+    Item,
+    Generic,
+    Living,
+    FallingBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifyEntityProfile {
+    Item,
+    Generic,
+    Living,
+    ArmorStand,
+    Pig,
+    FallingBlock,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +138,15 @@ pub struct VerifyCommand {
     pub height: f64,
     pub entity_id_mod4: usize,
     pub initial_tick_count: usize,
+    pub entity_rng_seed: Option<i64>,
+    pub entity_uuid: Option<String>,
+    pub bootstrap_fluids: bool,
+    pub entity_kind: VerifyEntityKind,
+    pub no_ai: bool,
+    pub no_gravity: bool,
+    pub fire_immune: bool,
+    pub start_fire_ticks: i32,
+    pub item_health: Option<i32>,
 }
 
 pub enum ParsedArgs {
@@ -117,6 +154,65 @@ pub enum ParsedArgs {
     Run(Args),
     Search(SearchCommand),
     Verify(VerifyCommand),
+}
+
+fn default_verify_dimensions(entity_kind: VerifyEntityKind) -> (f64, f64) {
+    match entity_kind {
+        VerifyEntityKind::Item => (VERIFY_DEFAULT_WIDTH, VERIFY_DEFAULT_HEIGHT),
+        VerifyEntityKind::Generic | VerifyEntityKind::Living => {
+            (VERIFY_GENERIC_WIDTH, VERIFY_GENERIC_HEIGHT)
+        }
+        VerifyEntityKind::FallingBlock => (VERIFY_FALLING_BLOCK_WIDTH, VERIFY_FALLING_BLOCK_HEIGHT),
+    }
+}
+
+fn verify_entity_profile_spec(profile: VerifyEntityProfile) -> (VerifyEntityKind, f64, f64) {
+    match profile {
+        VerifyEntityProfile::Item => (
+            VerifyEntityKind::Item,
+            VERIFY_DEFAULT_WIDTH,
+            VERIFY_DEFAULT_HEIGHT,
+        ),
+        VerifyEntityProfile::Generic => (
+            VerifyEntityKind::Generic,
+            VERIFY_GENERIC_WIDTH,
+            VERIFY_GENERIC_HEIGHT,
+        ),
+        VerifyEntityProfile::Living => (
+            VerifyEntityKind::Living,
+            VERIFY_GENERIC_WIDTH,
+            VERIFY_GENERIC_HEIGHT,
+        ),
+        VerifyEntityProfile::ArmorStand => (
+            VerifyEntityKind::Living,
+            VERIFY_ARMOR_STAND_WIDTH,
+            VERIFY_ARMOR_STAND_HEIGHT,
+        ),
+        VerifyEntityProfile::Pig => (
+            VerifyEntityKind::Living,
+            VERIFY_PIG_WIDTH,
+            VERIFY_PIG_HEIGHT,
+        ),
+        VerifyEntityProfile::FallingBlock => (
+            VerifyEntityKind::FallingBlock,
+            VERIFY_FALLING_BLOCK_WIDTH,
+            VERIFY_FALLING_BLOCK_HEIGHT,
+        ),
+    }
+}
+
+fn parse_verify_entity_profile(value: &str) -> Result<VerifyEntityProfile, String> {
+    match value {
+        "item" => Ok(VerifyEntityProfile::Item),
+        "generic" => Ok(VerifyEntityProfile::Generic),
+        "living" => Ok(VerifyEntityProfile::Living),
+        "armor-stand" => Ok(VerifyEntityProfile::ArmorStand),
+        "pig" => Ok(VerifyEntityProfile::Pig),
+        "falling-block" => Ok(VerifyEntityProfile::FallingBlock),
+        other => Err(format!(
+            "--entity-profile must be one of: item, generic, living, armor-stand, pig, falling-block; got {other}."
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -562,7 +658,9 @@ pub fn usage() -> String {
         "verify:",
         "  Load a .litematic world, simulate one entity state in 3D, and write per-tick CSV/JSON output.",
         "  Required inputs are the schematic plus x/y/z and vx/vy/vz. Optional advanced flags: --width,",
-        "  --height, --entity-id-mod4, --initial-tick-count, and --target-speed.",
+        "  --height, --entity-kind, --entity-profile, --entity-id-mod4, --initial-tick-count, --entity-rng-seed,",
+        "  --bootstrap-fluids, --no-ai, --no-gravity, --fire-immune, --start-fire-ticks, --health/--item-health,",
+        "  and --target-speed.",
         "",
         "legacy search:",
         "  Searches transition prefixes for a slime-piston-launched 1.17.1 item. The launch state is modeled as",
@@ -860,8 +958,20 @@ fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
         height: VERIFY_DEFAULT_HEIGHT,
         entity_id_mod4: 0,
         initial_tick_count: 0,
+        entity_rng_seed: None,
+        entity_uuid: None,
+        bootstrap_fluids: false,
+        entity_kind: VerifyEntityKind::Item,
+        no_ai: false,
+        no_gravity: false,
+        fire_immune: false,
+        start_fire_ticks: 0,
+        item_health: None,
     };
     let mut positional_input: Option<PathBuf> = None;
+    let mut width_set = false;
+    let mut height_set = false;
+    let mut entity_kind_set = false;
     let mut i = 0;
     while i < argv.len() {
         let arg = &argv[i];
@@ -886,14 +996,71 @@ fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
             "--start-on-ground" => {
                 command.start_on_ground = parse_bool(next(&mut i)?, "--start-on-ground")?
             }
-            "--width" => command.width = parse_f64(next(&mut i)?, "--width")?,
-            "--height" => command.height = parse_f64(next(&mut i)?, "--height")?,
+            "--width" => {
+                command.width = parse_f64(next(&mut i)?, "--width")?;
+                width_set = true;
+            }
+            "--height" => {
+                command.height = parse_f64(next(&mut i)?, "--height")?;
+                height_set = true;
+            }
+            "--entity-kind" => {
+                command.entity_kind = match next(&mut i)? {
+                    "item" => VerifyEntityKind::Item,
+                    "generic" => VerifyEntityKind::Generic,
+                    "living" => VerifyEntityKind::Living,
+                    "falling-block" => VerifyEntityKind::FallingBlock,
+                    other => {
+                        return Err(format!(
+                            "--entity-kind must be one of: item, generic, living, falling-block; got {other}."
+                        ));
+                    }
+                };
+                entity_kind_set = true;
+            }
+            "--entity-profile" => {
+                let profile = parse_verify_entity_profile(next(&mut i)?)?;
+                let (entity_kind, width, height) = verify_entity_profile_spec(profile);
+                if !entity_kind_set {
+                    command.entity_kind = entity_kind;
+                }
+                if !width_set {
+                    command.width = width;
+                    width_set = true;
+                }
+                if !height_set {
+                    command.height = height;
+                    height_set = true;
+                }
+            }
             "--entity-id-mod4" => {
                 command.entity_id_mod4 = parse_usize(next(&mut i)?, "--entity-id-mod4")?
             }
             "--initial-tick-count" => {
                 command.initial_tick_count = parse_usize(next(&mut i)?, "--initial-tick-count")?
             }
+            "--entity-rng-seed" => {
+                command.entity_rng_seed = Some(parse_i64(next(&mut i)?, "--entity-rng-seed")?)
+            }
+            "--entity-uuid" => {
+                let uuid_text = next(&mut i)?;
+                let uuid = Uuid::parse_str(uuid_text)
+                    .map_err(|error| format!("--entity-uuid must be a valid UUID: {error}"))?;
+                command.entity_uuid = Some(uuid.to_string());
+            }
+            "--bootstrap-fluids" => {
+                command.bootstrap_fluids = parse_bool(next(&mut i)?, "--bootstrap-fluids")?
+            }
+            "--no-ai" => command.no_ai = parse_bool(next(&mut i)?, "--no-ai")?,
+            "--no-gravity" => command.no_gravity = parse_bool(next(&mut i)?, "--no-gravity")?,
+            "--fire-immune" => command.fire_immune = parse_bool(next(&mut i)?, "--fire-immune")?,
+            "--start-fire-ticks" => {
+                command.start_fire_ticks = parse_i32(next(&mut i)?, "--start-fire-ticks")?
+            }
+            "--item-health" => {
+                command.item_health = Some(parse_i32(next(&mut i)?, "--item-health")?)
+            }
+            "--health" => command.item_health = Some(parse_i32(next(&mut i)?, "--health")?),
             "--help" | "-h" => return Ok(command),
             other if other.starts_with('-') => {
                 return Err(format!("Unknown argument for verify: {other}"));
@@ -913,6 +1080,15 @@ fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
             "verify requires a .litematic input. Pass it as the first positional argument or with --input.".to_string()
         })?;
     }
+    if !width_set || !height_set {
+        let (default_width, default_height) = default_verify_dimensions(command.entity_kind);
+        if !width_set {
+            command.width = default_width;
+        }
+        if !height_set {
+            command.height = default_height;
+        }
+    }
     if !(command.target_speed.is_finite() && command.target_speed > 0.0) {
         return Err("--target-speed must be a finite positive number.".to_string());
     }
@@ -924,6 +1100,9 @@ fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
     }
     if command.entity_id_mod4 > 3 {
         return Err("--entity-id-mod4 must be in [0, 3].".to_string());
+    }
+    if command.item_health.is_some_and(|value| value <= 0) {
+        return Err("--item-health must be >= 1 when provided.".to_string());
     }
     Ok(command)
 }
@@ -1056,6 +1235,16 @@ pub fn main_cli(argv: Vec<String>) -> Result<(), String> {
 fn parse_usize(text: &str, flag: &str) -> Result<usize, String> {
     text.parse::<usize>()
         .map_err(|_| format!("{} must be a non-negative integer.", flag))
+}
+
+fn parse_i64(text: &str, flag: &str) -> Result<i64, String> {
+    text.parse::<i64>()
+        .map_err(|_| format!("{} must be a signed 64-bit integer.", flag))
+}
+
+fn parse_i32(text: &str, flag: &str) -> Result<i32, String> {
+    text.parse::<i32>()
+        .map_err(|_| format!("{} must be a signed 32-bit integer.", flag))
 }
 
 fn parse_f64(text: &str, flag: &str) -> Result<f64, String> {
@@ -2731,6 +2920,156 @@ mod tests {
             panic!("expected runnable args");
         };
         assert_eq!(args.ticks, 33);
+    }
+
+    #[test]
+    fn parse_verify_args_reads_bootstrap_fluids() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--bootstrap-fluids".to_string(),
+            "true".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert!(command.bootstrap_fluids);
+    }
+
+    #[test]
+    fn parse_verify_args_defaults_bootstrap_fluids_to_false() {
+        let argv = vec!["fixture.litematic".to_string()];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert!(!command.bootstrap_fluids);
+    }
+
+    #[test]
+    fn parse_verify_args_reads_entity_uuid() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-uuid".to_string(),
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(
+            command.entity_uuid.as_deref(),
+            Some("123e4567-e89b-42d3-a456-426614174000")
+        );
+    }
+
+    #[test]
+    fn parse_verify_args_reads_entity_kind() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-kind".to_string(),
+            "generic".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::Generic);
+        assert_eq!(command.width, VERIFY_GENERIC_WIDTH);
+        assert_eq!(command.height, VERIFY_GENERIC_HEIGHT);
+    }
+
+    #[test]
+    fn parse_verify_args_living_defaults_to_generic_dimensions() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-kind".to_string(),
+            "living".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::Living);
+        assert_eq!(command.width, VERIFY_GENERIC_WIDTH);
+        assert_eq!(command.height, VERIFY_GENERIC_HEIGHT);
+    }
+
+    #[test]
+    fn parse_verify_args_falling_block_defaults_to_falling_block_dimensions() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-kind".to_string(),
+            "falling-block".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::FallingBlock);
+        assert_eq!(command.width, VERIFY_FALLING_BLOCK_WIDTH);
+        assert_eq!(command.height, VERIFY_FALLING_BLOCK_HEIGHT);
+    }
+
+    #[test]
+    fn parse_verify_args_reads_entity_profile() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-profile".to_string(),
+            "armor-stand".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::Living);
+        assert_eq!(command.width, VERIFY_ARMOR_STAND_WIDTH);
+        assert_eq!(command.height, VERIFY_ARMOR_STAND_HEIGHT);
+    }
+
+    #[test]
+    fn parse_verify_args_keeps_explicit_size_over_profile() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--width".to_string(),
+            "0.7".to_string(),
+            "--entity-profile".to_string(),
+            "armor-stand".to_string(),
+            "--height".to_string(),
+            "1.2".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::Living);
+        assert_eq!(command.width, 0.7);
+        assert_eq!(command.height, 1.2);
+    }
+
+    #[test]
+    fn parse_verify_args_keeps_explicit_entity_kind_over_profile_kind() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--entity-profile".to_string(),
+            "armor-stand".to_string(),
+            "--entity-kind".to_string(),
+            "generic".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.entity_kind, VerifyEntityKind::Generic);
+        assert_eq!(command.width, VERIFY_ARMOR_STAND_WIDTH);
+        assert_eq!(command.height, VERIFY_ARMOR_STAND_HEIGHT);
+    }
+
+    #[test]
+    fn parse_verify_args_reads_fire_state_flags() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--no-ai".to_string(),
+            "true".to_string(),
+            "--no-gravity".to_string(),
+            "true".to_string(),
+            "--fire-immune".to_string(),
+            "true".to_string(),
+            "--start-fire-ticks".to_string(),
+            "39".to_string(),
+            "--item-health".to_string(),
+            "7".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert!(command.no_ai);
+        assert!(command.no_gravity);
+        assert!(command.fire_immune);
+        assert_eq!(command.start_fire_ticks, 39);
+        assert_eq!(command.item_health, Some(7));
+    }
+
+    #[test]
+    fn parse_verify_args_reads_health_alias() {
+        let argv = vec![
+            "fixture.litematic".to_string(),
+            "--health".to_string(),
+            "9".to_string(),
+        ];
+        let command = parse_verify_args(&argv).expect("verify args should parse");
+        assert_eq!(command.item_health, Some(9));
     }
 
     #[test]
