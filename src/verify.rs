@@ -16,7 +16,7 @@ use mc_schem::{Block, Region};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -781,7 +781,6 @@ impl DynamicBlockTicks {
                     }
                     ticks.schedule_pointed_dripstone_tick_if_needed(region, 0, pos);
                     ticks.schedule_big_dripleaf_tick_if_needed(region, 0, pos);
-                    ticks.schedule_bubble_tick_if_needed(region, 0, pos);
                 }
             }
         }
@@ -1984,6 +1983,16 @@ struct VerifyTickRow {
     center_block: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct VerifyTracePoint {
+    pub x: f64,
+    pub y: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub on_ground: bool,
+    pub support_block: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifyMetrics {
@@ -2067,7 +2076,18 @@ struct VerifyJsonOutput {
     inspect_tick: Option<VerifyTickRow>,
 }
 
-pub(crate) fn run_verify_command(command: &VerifyCommand) -> Result<(), String> {
+#[derive(Clone, Debug)]
+pub(crate) struct VerifyRunOutput {
+    pub world_name: String,
+    pub shape: [i32; 3],
+    pub tick_csv_path: PathBuf,
+    pub summary_csv_path: PathBuf,
+    pub summary_json_path: PathBuf,
+    inspect_tick: Option<VerifyTickRow>,
+    pub approximate_collision_block_count: usize,
+}
+
+fn execute_verify_command(command: &VerifyCommand) -> Result<VerifyRunOutput, String> {
     if let Some(tick) = command.inspect_tick {
         if tick > command.ticks {
             return Err("--tick cannot be greater than --ticks.".to_string());
@@ -2096,13 +2116,32 @@ pub(crate) fn run_verify_command(command: &VerifyCommand) -> Result<(), String> 
         inspect_tick.as_ref(),
     )?;
 
-    println!("World: {}", world.name);
-    let shape = world.region.shape();
-    println!("Shape: {} x {} x {}", shape[0], shape[1], shape[2]);
-    println!("Tick CSV: {}", tick_csv_path.display());
-    println!("Summary CSV: {}", summary_csv_path.display());
-    println!("Summary JSON: {}", summary_json_path.display());
-    if let Some(row) = inspect_tick {
+    Ok(VerifyRunOutput {
+        world_name: world.name,
+        shape: world.region.shape(),
+        tick_csv_path,
+        summary_csv_path,
+        summary_json_path,
+        inspect_tick,
+        approximate_collision_block_count: world.approximate_collision_blocks.len(),
+    })
+}
+
+pub(crate) fn run_verify_command_quiet(command: &VerifyCommand) -> Result<VerifyRunOutput, String> {
+    execute_verify_command(command)
+}
+
+pub(crate) fn run_verify_command(command: &VerifyCommand) -> Result<(), String> {
+    let output = execute_verify_command(command)?;
+    println!("World: {}", output.world_name);
+    println!(
+        "Shape: {} x {} x {}",
+        output.shape[0], output.shape[1], output.shape[2]
+    );
+    println!("Tick CSV: {}", output.tick_csv_path.display());
+    println!("Summary CSV: {}", output.summary_csv_path.display());
+    println!("Summary JSON: {}", output.summary_json_path.display());
+    if let Some(row) = output.inspect_tick {
         println!();
         println!(
             "Tick {} => pos=({:.6}, {:.6}, {:.6}) vel=({:.6}, {:.6}, {:.6}) fluid={} water={} lava={} fluidHeight={:.6} onFire={} fireTicks={} itemHealth={}",
@@ -2124,19 +2163,37 @@ pub(crate) fn run_verify_command(command: &VerifyCommand) -> Result<(), String> 
                 .unwrap_or_else(|| "n/a".to_string()),
         );
     }
-    if !world.approximate_collision_blocks.is_empty() {
+    if output.approximate_collision_block_count > 0 {
         println!();
         println!(
             "Warning: {} block types use approximate non-solid collision handling.",
-            world.approximate_collision_blocks.len()
+            output.approximate_collision_block_count
         );
     }
     Ok(())
 }
 
+pub(crate) fn simulate_verify_trace(
+    world: &LoadedSchematic,
+    command: &VerifyCommand,
+) -> Vec<VerifyTracePoint> {
+    simulate(world, command)
+        .into_iter()
+        .map(|row| VerifyTracePoint {
+            x: row.x,
+            y: row.y,
+            vx: row.vx,
+            vy: row.vy,
+            on_ground: row.on_ground,
+            support_block: row.support_block,
+        })
+        .collect()
+}
+
 fn simulate(world: &LoadedSchematic, command: &VerifyCommand) -> Vec<VerifyTickRow> {
     let mut region = world.region.clone();
     normalize_loaded_snapshot(&mut region);
+    normalize_loaded_motion_snapshot(&mut region);
     let mut block_ticks = DynamicBlockTicks::bootstrap(&region);
     let mut fluid_ticks = if command.bootstrap_fluids {
         DynamicFluidTicks::bootstrap(&region)
@@ -2678,6 +2735,30 @@ fn normalize_loaded_snapshot(region: &mut Region) {
     }
 }
 
+fn normalize_loaded_motion_snapshot(region: &mut Region) {
+    let shape = region.shape();
+    for x in 0..shape[0] {
+        for y in 0..shape[1] {
+            for z in 0..shape[2] {
+                let pos = [x, y, z];
+                let Some(block) = block_at(region, pos).cloned() else {
+                    continue;
+                };
+                if snapshot_bubble_column_is_inactive_on_reload(region, pos, &block) {
+                    set_water_block(
+                        region,
+                        pos,
+                        DynamicWaterState {
+                            amount: 8,
+                            falling: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn snapshot_block_is_pruned_on_reload(region: &Region, pos: [i32; 3], block: &Block) -> bool {
     if block.namespace != "minecraft" {
         return false;
@@ -2687,8 +2768,32 @@ fn snapshot_block_is_pruned_on_reload(region: &Region, pos: [i32; 3], block: &Bl
         "cactus" => !cactus_can_survive(region, pos),
         "scaffolding" => scaffolding_distance(region, pos) == 7,
         "pointed_dripstone" => !pointed_dripstone_can_survive(region, pos, block),
+        "big_dripleaf_stem" => !big_dripleaf_stem_can_survive(region, pos),
+        "big_dripleaf" => snapshot_big_dripleaf_leaf_is_pruned_on_reload(region, pos),
         _ => false,
     }
+}
+
+fn snapshot_bubble_column_is_inactive_on_reload(
+    region: &Region,
+    pos: [i32; 3],
+    block: &Block,
+) -> bool {
+    if block.namespace != "minecraft" || block.id != "bubble_column" {
+        return false;
+    }
+    !matches!(
+        bubble_column_state_from_below(region, pos, block),
+        Some(expected) if expected.id == "bubble_column" && expected.full_id() == block.full_id()
+    )
+}
+
+fn snapshot_big_dripleaf_leaf_is_pruned_on_reload(region: &Region, pos: [i32; 3]) -> bool {
+    let below_pos = offset_pos(pos, [0, -1, 0]);
+    block_at(region, below_pos)
+        .filter(|below| below.namespace == "minecraft" && below.id == "big_dripleaf_stem")
+        .map(|_| !big_dripleaf_stem_can_survive(region, below_pos))
+        .unwrap_or(false)
 }
 
 fn collect_hopper_positions(region: &Region) -> Vec<[i32; 3]> {
@@ -7066,6 +7171,51 @@ mod tests {
             "minecraft:big_dripleaf[facing=north,tilt=none,waterlogged=false]"
         );
 
+        let mut dripleaf_stem_region = region_with_shape([1, 3, 1]);
+        dripleaf_stem_region
+            .set_block(
+                [0, 1, 0],
+                &parse_block("minecraft:big_dripleaf_stem[facing=north,waterlogged=false]"),
+            )
+            .unwrap();
+        normalize_loaded_snapshot(&mut dripleaf_stem_region);
+        assert_eq!(
+            block_full_id(
+                block_at(&dripleaf_stem_region, [0, 1, 0])
+                    .expect("unsupported big dripleaf stem pruned on load")
+            ),
+            "minecraft:air"
+        );
+
+        let mut dripleaf_chain_region = region_with_shape([1, 3, 1]);
+        dripleaf_chain_region
+            .set_block(
+                [0, 1, 0],
+                &parse_block("minecraft:big_dripleaf_stem[facing=north,waterlogged=false]"),
+            )
+            .unwrap();
+        dripleaf_chain_region
+            .set_block(
+                [0, 2, 0],
+                &parse_block("minecraft:big_dripleaf[facing=north,tilt=none,waterlogged=false]"),
+            )
+            .unwrap();
+        normalize_loaded_snapshot(&mut dripleaf_chain_region);
+        assert_eq!(
+            block_full_id(
+                block_at(&dripleaf_chain_region, [0, 1, 0])
+                    .expect("unsupported big dripleaf stem pruned from chain on load")
+            ),
+            "minecraft:air"
+        );
+        assert_eq!(
+            block_full_id(
+                block_at(&dripleaf_chain_region, [0, 2, 0])
+                    .expect("leaf above unsupported stem pruned on load")
+            ),
+            "minecraft:air"
+        );
+
         let mut ladder_region = region_with_shape([1, 2, 1]);
         ladder_region
             .set_block(
@@ -9283,7 +9433,26 @@ mod tests {
     }
 
     #[test]
-    fn source_water_above_bubble_support_forms_column_like_vanilla() {
+    fn source_water_above_bubble_support_persists_without_neighbor_event() {
+        for support_block in ["minecraft:soul_sand", "minecraft:magma_block"] {
+            let mut region = region_with_shape([1, 3, 1]);
+            region
+                .set_block([0, 0, 0], &parse_block(support_block))
+                .unwrap();
+            region
+                .set_block([0, 1, 0], &parse_block("minecraft:water"))
+                .unwrap();
+            run_world_ticks(&mut region, 25);
+            assert_eq!(
+                block_full_id(block_at(&region, [0, 1, 0]).expect("snapshot water should persist")),
+                "minecraft:water",
+                "unexpected snapshot bootstrap bubble update for {support_block}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_source_water_above_bubble_support_forms_column() {
         for (support_block, expected_column) in [
             ("minecraft:soul_sand", "minecraft:bubble_column[drag=false]"),
             (
@@ -9298,7 +9467,9 @@ mod tests {
             region
                 .set_block([0, 1, 0], &parse_block("minecraft:water"))
                 .unwrap();
-            run_world_ticks(&mut region, 20);
+            let mut block_ticks = DynamicBlockTicks::default();
+            block_ticks.schedule(BUBBLE_COLUMN_FORM_TICK_DELAY, [0, 1, 0]);
+            block_ticks.run_due(&mut region, BUBBLE_COLUMN_FORM_TICK_DELAY);
             assert_eq!(
                 block_full_id(block_at(&region, [0, 1, 0]).expect("bubble column should form")),
                 expected_column,
@@ -9308,7 +9479,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_bubble_column_reverts_to_source_water() {
+    fn unsupported_bubble_column_persists_without_neighbor_event() {
         let mut region = region_with_shape([1, 2, 1]);
         region
             .set_block([0, 0, 0], &parse_block("minecraft:smooth_stone"))
@@ -9319,11 +9490,142 @@ mod tests {
                 &parse_block("minecraft:bubble_column[drag=true]"),
             )
             .unwrap();
-        run_world_ticks(&mut region, 5);
+        run_world_ticks(&mut region, 25);
+        assert_eq!(
+            block_full_id(
+                block_at(&region, [0, 1, 0]).expect("snapshot bubble column should persist")
+            ),
+            "minecraft:bubble_column[drag=true]"
+        );
+    }
+
+    #[test]
+    fn scheduled_unsupported_bubble_column_reverts_to_source_water() {
+        let mut region = region_with_shape([1, 2, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:smooth_stone"))
+            .unwrap();
+        region
+            .set_block(
+                [0, 1, 0],
+                &parse_block("minecraft:bubble_column[drag=true]"),
+            )
+            .unwrap();
+        let mut block_ticks = DynamicBlockTicks::default();
+        block_ticks.schedule(BUBBLE_COLUMN_CHECK_TICK_DELAY, [0, 1, 0]);
+        block_ticks.run_due(&mut region, BUBBLE_COLUMN_CHECK_TICK_DELAY);
         assert_eq!(
             block_full_id(block_at(&region, [0, 1, 0]).expect("bubble column should revert")),
             "minecraft:water"
         );
+    }
+
+    #[test]
+    fn invalid_bubble_column_is_inactive_for_item_motion_after_reload() {
+        let mut region = region_with_shape([1, 2, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:smooth_stone"))
+            .unwrap();
+        region
+            .set_block(
+                [0, 1, 0],
+                &parse_block("minecraft:bubble_column[drag=true]"),
+            )
+            .unwrap();
+        let world = LoadedSchematic {
+            name: "invalid-bubble-column-snapshot".to_string(),
+            region,
+            approximate_collision_blocks: Vec::new(),
+        };
+        let command = VerifyCommand {
+            input: std::path::PathBuf::from("invalid-bubble-column-snapshot.litematic"),
+            out: std::path::PathBuf::from("artifacts/test"),
+            target_speed: 0.0,
+            ticks: 2,
+            inspect_tick: Some(2),
+            start_x: 0.5,
+            start_y: 1.0,
+            start_z: 0.5,
+            start_vx: 0.0,
+            start_vy: 0.0,
+            start_vz: 0.0,
+            start_on_ground: false,
+            width: VERIFY_DEFAULT_WIDTH,
+            height: VERIFY_DEFAULT_HEIGHT,
+            entity_id_mod4: 0,
+            initial_tick_count: 0,
+            entity_rng_seed: None,
+            entity_uuid: None,
+            bootstrap_fluids: false,
+            entity_kind: VerifyEntityKind::Item,
+            no_ai: false,
+            no_gravity: true,
+            fire_immune: false,
+            start_fire_ticks: 0,
+            item_health: Some(5),
+        };
+
+        let rows = simulate(&world, &command);
+        let tick1 = &rows[1];
+        let tick2 = &rows[2];
+        assert!((tick1.vy - 0.0004900000328104948).abs() < 1.0e-12);
+        assert!((tick2.vy - 0.0009702000743107886).abs() < 1.0e-12);
+        assert!(tick1.in_water);
+        assert!(tick2.in_water);
+    }
+
+    #[test]
+    fn valid_bubble_column_keeps_column_boost_after_reload() {
+        let mut region = region_with_shape([1, 2, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:soul_sand"))
+            .unwrap();
+        region
+            .set_block(
+                [0, 1, 0],
+                &parse_block("minecraft:bubble_column[drag=false]"),
+            )
+            .unwrap();
+        let world = LoadedSchematic {
+            name: "valid-bubble-column-snapshot".to_string(),
+            region,
+            approximate_collision_blocks: Vec::new(),
+        };
+        let command = VerifyCommand {
+            input: std::path::PathBuf::from("valid-bubble-column-snapshot.litematic"),
+            out: std::path::PathBuf::from("artifacts/test"),
+            target_speed: 0.0,
+            ticks: 2,
+            inspect_tick: Some(2),
+            start_x: 0.5,
+            start_y: 1.0,
+            start_z: 0.5,
+            start_vx: 0.0,
+            start_vy: 0.0,
+            start_vz: 0.0,
+            start_on_ground: false,
+            width: VERIFY_DEFAULT_WIDTH,
+            height: VERIFY_DEFAULT_HEIGHT,
+            entity_id_mod4: 0,
+            initial_tick_count: 0,
+            entity_rng_seed: None,
+            entity_uuid: None,
+            bootstrap_fluids: false,
+            entity_kind: VerifyEntityKind::Item,
+            no_ai: false,
+            no_gravity: true,
+            fire_immune: false,
+            start_fire_ticks: 0,
+            item_health: Some(5),
+        };
+
+        let rows = simulate(&world, &command);
+        let tick1 = &rows[1];
+        let tick2 = &rows[2];
+        assert!((tick1.vy - 0.09849000194015914).abs() < 1.0e-12);
+        assert!((tick2.vy - 0.1945202056872523).abs() < 1.0e-12);
+        assert!(tick1.in_water);
+        assert!(tick2.in_water);
     }
 
     #[test]
@@ -9343,10 +9645,13 @@ mod tests {
 
     #[test]
     fn simulate_applies_bubble_column_surface_boost() {
-        let mut region = region_with_shape([1, 2, 1]);
+        let mut region = region_with_shape([1, 3, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:soul_sand"))
+            .unwrap();
         region
             .set_block(
-                [0, 0, 0],
+                [0, 1, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
@@ -9362,7 +9667,7 @@ mod tests {
             ticks: 1,
             inspect_tick: Some(1),
             start_x: 0.5,
-            start_y: 0.0,
+            start_y: 1.0,
             start_z: 0.5,
             start_vx: 0.0,
             start_vy: 0.0,
@@ -9389,7 +9694,7 @@ mod tests {
         let expected_vy =
             (BUOYANCY + BUBBLE_COLUMN_SURFACE_ACCELERATION) * VERTICAL_MOVEMENT_DAMPING;
         assert!((tick.x - 0.5).abs() < 1.0e-12);
-        assert!((tick.y - BUOYANCY).abs() < 1.0e-12);
+        assert!((tick.y - (1.0 + BUOYANCY)).abs() < 1.0e-12);
         assert!((tick.vy - expected_vy).abs() < 1.0e-12);
         assert!(tick.in_water);
         assert!(!tick.on_ground);
@@ -9397,16 +9702,19 @@ mod tests {
 
     #[test]
     fn simulate_applies_bubble_column_internal_boost_when_column_continues_above() {
-        let mut region = region_with_shape([1, 2, 1]);
+        let mut region = region_with_shape([1, 4, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:soul_sand"))
+            .unwrap();
         region
             .set_block(
-                [0, 0, 0],
+                [0, 1, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
         region
             .set_block(
-                [0, 1, 0],
+                [0, 2, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
@@ -9422,7 +9730,7 @@ mod tests {
             ticks: 1,
             inspect_tick: Some(1),
             start_x: 0.5,
-            start_y: 0.0,
+            start_y: 1.0,
             start_z: 0.5,
             start_vx: 0.0,
             start_vy: 0.0,
@@ -9448,7 +9756,7 @@ mod tests {
         let tick = &rows[1];
         let expected_vy =
             (BUOYANCY + BUBBLE_COLUMN_INTERNAL_ACCELERATION) * VERTICAL_MOVEMENT_DAMPING;
-        assert!((tick.y - BUOYANCY).abs() < 1.0e-12);
+        assert!((tick.y - (1.0 + BUOYANCY)).abs() < 1.0e-12);
         assert!((tick.vy - expected_vy).abs() < 1.0e-12);
         assert!(tick.in_water);
         assert!(!tick.on_ground);
@@ -9456,10 +9764,13 @@ mod tests {
 
     #[test]
     fn simulate_item_bubble_column_surface_matches_vanilla_probe() {
-        let mut region = region_with_shape([1, 2, 1]);
+        let mut region = region_with_shape([1, 3, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:soul_sand"))
+            .unwrap();
         region
             .set_block(
-                [0, 0, 0],
+                [0, 1, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
@@ -9475,7 +9786,7 @@ mod tests {
             ticks: 1,
             inspect_tick: Some(1),
             start_x: 0.5,
-            start_y: 0.0,
+            start_y: 1.0,
             start_z: 0.5,
             start_vx: 0.0,
             start_vy: 0.0,
@@ -9499,7 +9810,7 @@ mod tests {
         let rows = simulate(&world, &command);
         let tick = &rows[1];
         assert!((tick.x - 0.5).abs() < 5.0e-8);
-        assert!((tick.y - 0.000_500_000_023_75).abs() < 5.0e-8);
+        assert!((tick.y - 1.000_500_000_023_75).abs() < 5.0e-8);
         assert!((tick.z - 0.5).abs() < 5.0e-8);
         assert!((tick.vx - 0.0).abs() < 5.0e-8);
         assert!((tick.vy - 0.098_490_001_940_159_14).abs() < 5.0e-8);
@@ -9510,16 +9821,19 @@ mod tests {
 
     #[test]
     fn simulate_item_bubble_column_internal_matches_vanilla_probe() {
-        let mut region = region_with_shape([1, 2, 1]);
+        let mut region = region_with_shape([1, 4, 1]);
+        region
+            .set_block([0, 0, 0], &parse_block("minecraft:soul_sand"))
+            .unwrap();
         region
             .set_block(
-                [0, 0, 0],
+                [0, 1, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
         region
             .set_block(
-                [0, 1, 0],
+                [0, 2, 0],
                 &parse_block("minecraft:bubble_column[drag=false]"),
             )
             .unwrap();
@@ -9535,7 +9849,7 @@ mod tests {
             ticks: 1,
             inspect_tick: Some(1),
             start_x: 0.5,
-            start_y: 0.0,
+            start_y: 1.0,
             start_z: 0.5,
             start_vx: 0.0,
             start_vy: 0.0,
@@ -9559,7 +9873,7 @@ mod tests {
         let rows = simulate(&world, &command);
         let tick = &rows[1];
         assert!((tick.x - 0.5).abs() < 5.0e-8);
-        assert!((tick.y - 0.000_500_000_023_75).abs() < 5.0e-8);
+        assert!((tick.y - 1.000_500_000_023_75).abs() < 5.0e-8);
         assert!((tick.z - 0.5).abs() < 5.0e-8);
         assert!((tick.vx - 0.0).abs() < 5.0e-8);
         assert!((tick.vy - 0.059_290_001_177_219_67).abs() < 5.0e-8);
@@ -10842,7 +11156,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_big_dripleaf_stem_persists_without_scheduled_tick() {
+    fn scheduled_unsupported_big_dripleaf_stem_breaks() {
         let mut region = region_with_shape([1, 3, 1]);
         region
             .set_block(
@@ -10850,13 +11164,12 @@ mod tests {
                 &parse_block("minecraft:big_dripleaf_stem[facing=north,waterlogged=false]"),
             )
             .unwrap();
-        run_world_ticks(&mut region, 1);
+        let mut block_ticks = DynamicBlockTicks::default();
+        block_ticks.schedule(BIG_DRIPLEAF_SURVIVAL_TICK_DELAY, [0, 1, 0]);
+        block_ticks.run_due(&mut region, BIG_DRIPLEAF_SURVIVAL_TICK_DELAY);
         assert_eq!(
-            block_full_id(
-                block_at(&region, [0, 1, 0])
-                    .expect("unsupported dripleaf stem persists in snapshot")
-            ),
-            "minecraft:big_dripleaf_stem[facing=north,waterlogged=false]"
+            block_full_id(block_at(&region, [0, 1, 0]).expect("unsupported dripleaf stem breaks")),
+            "minecraft:air"
         );
     }
 

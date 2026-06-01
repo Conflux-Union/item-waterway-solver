@@ -12,3 +12,4 @@ time = { version = "0.3", features = ["formatting"] }
 mc_schem = "1.1.2"
 fastnbt = "2.6.1"
 uuid = "1.18.1"
+rayon = "1.10"

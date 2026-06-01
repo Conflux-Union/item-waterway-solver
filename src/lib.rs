@@ -1,4 +1,7 @@
+use mc_schem::{Block, Region};
+use rayon::prelude::*;
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -8,7 +11,11 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 mod litematic;
 mod verify;
-use verify::run_verify_command;
+use litematic::{LoadedSchematic, save_litematic};
+use verify::{
+    VerifyRunOutput, VerifyTracePoint, run_verify_command, run_verify_command_quiet,
+    simulate_verify_trace,
+};
 
 const WIDTH: f64 = 0.25;
 const HEIGHT: f64 = 0.25;
@@ -110,6 +117,7 @@ pub struct SearchCommand {
     pub out: PathBuf,
     pub top: usize,
     pub target_speed: f64,
+    pub mode: Mode,
     pub effort: EffortPreset,
     pub export_cycles: usize,
     pub export_top_count: usize,
@@ -319,6 +327,7 @@ pub struct CycleSpec {
     signature: String,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct Layout {
     prefix_length: usize,
@@ -328,6 +337,7 @@ struct Layout {
     flow_directions: Vec<i8>,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct SimConfig {
     ticks: usize,
@@ -439,6 +449,13 @@ struct EarlyCandidate {
     entity_id_mod4: usize,
     initial_tick_count: usize,
     cadence: EarlyCadence,
+}
+
+#[derive(Clone, Debug)]
+struct StructureBeamCandidate {
+    prefix_index: usize,
+    cycle_index: usize,
+    score: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -595,6 +612,7 @@ struct JsonOutput {
     top: Vec<ResultRow>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct FluidTracker {
     height: f64,
@@ -602,6 +620,7 @@ struct FluidTracker {
     current_count: usize,
 }
 
+#[cfg(test)]
 impl FluidTracker {
     fn is_in_fluid(self) -> bool {
         self.height > 0.0
@@ -611,6 +630,7 @@ impl FluidTracker {
         self.height > FLUID_MOVEMENT_THRESHOLD
     }
 }
+#[cfg(test)]
 impl Layout {
     fn new(prefix_cells: &[Cell], cycle_cells: &[Cell]) -> Self {
         let prefix_length = prefix_cells.len();
@@ -652,7 +672,7 @@ pub fn usage() -> String {
     [
         "Usage:",
         "  cargo run --release -- verify <projection.litematic> --x 0.125 --y 1.0 --z 1.0 --vx 1.0 --vy 0.0 --vz 0.0 --ticks 200",
-        "  cargo run --release -- search [--effort fast|balanced|deep] [--top 20]",
+        "  cargo run --release -- search [--mode early|full] [--effort fast|balanced|deep] [--top 20]",
         "  cargo run --release -- [legacy search flags]",
         "",
         "verify:",
@@ -891,6 +911,7 @@ fn parse_search_args(argv: &[String]) -> Result<SearchCommand, String> {
         out: PathBuf::from("artifacts").join("item-waterway-search"),
         top: 20,
         target_speed: 0.5,
+        mode: Mode::Full,
         effort: EffortPreset::Balanced,
         export_cycles: 12,
         export_top_count: 1,
@@ -912,6 +933,16 @@ fn parse_search_args(argv: &[String]) -> Result<SearchCommand, String> {
             "--out" => command.out = PathBuf::from(next(&mut i)?),
             "--top" => command.top = parse_usize(next(&mut i)?, "--top")?,
             "--target-speed" => command.target_speed = parse_f64(next(&mut i)?, "--target-speed")?,
+            "--mode" => {
+                command.mode = match next(&mut i)? {
+                    "early" => Mode::Early,
+                    "full" => Mode::Full,
+                    other => {
+                        return Err(format!("--mode must be early or full; got {other}."));
+                    }
+                }
+            }
+            "--early-only" => command.mode = Mode::Early,
             "--effort" => {
                 command.effort = match next(&mut i)? {
                     "fast" => EffortPreset::Fast,
@@ -1110,6 +1141,7 @@ fn parse_verify_args(argv: &[String]) -> Result<VerifyCommand, String> {
 fn search_command_to_args(command: &SearchCommand) -> Result<Args, String> {
     let mut args = default_legacy_args();
     args.out = command.out.clone();
+    args.mode = command.mode;
     args.top = command.top;
     args.start_y = command.start_y;
     args.start_vx = command.start_vx;
@@ -1122,35 +1154,35 @@ fn search_command_to_args(command: &SearchCommand) -> Result<Args, String> {
     args.target_speed = target_speed;
     match command.effort {
         EffortPreset::Fast => {
-            args.ticks = 180;
-            args.top = args.top.min(20);
-            args.max_prefix = 4;
-            args.cadence_pairs = 6;
-            args.long_window = 80;
-            args.start_samples = 9;
-            args.early_limit = 400;
-            args.long_limit = 60;
-            args.full_cadence_pairs = 400;
+            args.ticks = 120;
+            args.top = args.top.min(10);
+            args.max_prefix = 2;
+            args.cadence_pairs = 4;
+            args.long_window = 48;
+            args.start_samples = 3;
+            args.early_limit = 40;
+            args.long_limit = 8;
+            args.full_cadence_pairs = 80;
         }
         EffortPreset::Balanced => {
-            args.ticks = 320;
-            args.max_prefix = 5;
-            args.cadence_pairs = 10;
-            args.long_window = 120;
-            args.start_samples = 17;
-            args.early_limit = 1200;
-            args.long_limit = 150;
-            args.full_cadence_pairs = 900;
+            args.ticks = 200;
+            args.max_prefix = 3;
+            args.cadence_pairs = 6;
+            args.long_window = 80;
+            args.start_samples = 5;
+            args.early_limit = 120;
+            args.long_limit = 20;
+            args.full_cadence_pairs = 160;
         }
         EffortPreset::Deep => {
-            args.ticks = 520;
-            args.max_prefix = 6;
-            args.cadence_pairs = 14;
-            args.long_window = 200;
-            args.start_samples = 25;
-            args.early_limit = 4000;
-            args.long_limit = 400;
-            args.full_cadence_pairs = 1800;
+            args.ticks = 320;
+            args.max_prefix = 4;
+            args.cadence_pairs = 8;
+            args.long_window = 120;
+            args.start_samples = 7;
+            args.early_limit = 300;
+            args.long_limit = 40;
+            args.full_cadence_pairs = 320;
         }
     }
     Ok(args)
@@ -1212,6 +1244,325 @@ fn run_search_outputs(args: &Args) -> Result<SearchPayload, String> {
     Ok(payload)
 }
 
+fn projection_floor_block_id(floor: &str) -> Result<&'static str, String> {
+    match floor {
+        "normal" | "stone" => Ok("minecraft:stone"),
+        "packed_ice" => Ok("minecraft:packed_ice"),
+        "blue_ice" => Ok("minecraft:blue_ice"),
+        "slime" => Ok("minecraft:slime_block"),
+        other => Err(format!("Unsupported projected floor type: {other}")),
+    }
+}
+
+fn projection_water_block(amount: u8) -> Result<Option<Block>, String> {
+    match amount {
+        0 => Ok(None),
+        8 => Block::from_id("minecraft:water")
+            .map(Some)
+            .map_err(|error| format!("Failed to build source water block: {error}")),
+        1..=7 => {
+            let level = 8 - amount;
+            Block::from_id(&format!("minecraft:water[level={level}]"))
+                .map(Some)
+                .map_err(|error| format!("Failed to build flowing water block: {error}"))
+        }
+        other => Err(format!(
+            "Projected water amount must be in [0, 8], got {other}."
+        )),
+    }
+}
+
+fn projection_cycle_count_for_lengths(
+    export_cycles: usize,
+    args: &Args,
+    prefix_length: usize,
+    cycle_length: usize,
+) -> usize {
+    let cycle_len = cycle_length.max(1);
+    let required_travel_cells = (args.ticks as f64 * args.target_speed).ceil() as usize + 4;
+    let required_cycle_cells = required_travel_cells.saturating_sub(prefix_length);
+    let required_cycles = required_cycle_cells.div_ceil(cycle_len).max(1);
+    export_cycles.max(required_cycles)
+}
+
+fn projection_cycle_count(command: &SearchCommand, args: &Args, row: &ResultRow) -> usize {
+    projection_cycle_count_for_lengths(
+        command.export_cycles,
+        args,
+        row.prefix_cells.len(),
+        row.cycle_cells.len(),
+    )
+}
+
+fn projection_verify_ticks(args: &Args, row: &ResultRow, cycle_count: usize) -> usize {
+    let total_cells = row.prefix_cells.len() + row.cycle_cells.len() * cycle_count;
+    let max_ticks = total_cells.saturating_sub(4).max(1) * args.target_ticks.max(1);
+    args.ticks.min(max_ticks).max(1)
+}
+
+fn projection_cells(row: &ResultRow, cycle_count: usize) -> Vec<CellDescription> {
+    let mut cells =
+        Vec::with_capacity(row.prefix_cells.len() + row.cycle_cells.len() * cycle_count);
+    cells.extend(row.prefix_cells.iter().cloned());
+    for _ in 0..cycle_count {
+        cells.extend(row.cycle_cells.iter().cloned());
+    }
+    cells
+}
+
+fn build_projection_region_from_cells(
+    name: &str,
+    cells: &[CellDescription],
+) -> Result<Region, String> {
+    let total_cells = cells.len();
+    let shape = [total_cells as i32 + 2, 5, 3];
+    let mut region = Region::with_shape(shape);
+    region.name = name.to_string();
+
+    for x in 0..shape[0] {
+        for y in 1..=3 {
+            region
+                .set_block(
+                    [x, y, 0],
+                    &Block::from_id("minecraft:glass").expect("valid glass"),
+                )
+                .map_err(|_| "Failed to set west wall block.".to_string())?;
+            region
+                .set_block(
+                    [x, y, 2],
+                    &Block::from_id("minecraft:glass").expect("valid glass"),
+                )
+                .map_err(|_| "Failed to set east wall block.".to_string())?;
+        }
+        for z in 0..=2 {
+            region
+                .set_block(
+                    [x, 4, z],
+                    &Block::from_id("minecraft:glass").expect("valid glass"),
+                )
+                .map_err(|_| "Failed to set roof block.".to_string())?;
+        }
+    }
+
+    for y in 1..=3 {
+        for z in 0..=2 {
+            region
+                .set_block(
+                    [0, y, z],
+                    &Block::from_id("minecraft:glass").expect("valid glass"),
+                )
+                .map_err(|_| "Failed to set front cap block.".to_string())?;
+            region
+                .set_block(
+                    [shape[0] - 1, y, z],
+                    &Block::from_id("minecraft:glass").expect("valid glass"),
+                )
+                .map_err(|_| "Failed to set back cap block.".to_string())?;
+        }
+    }
+
+    for (index, cell) in cells.iter().enumerate() {
+        let x = index as i32 + 1;
+        let floor = Block::from_id(projection_floor_block_id(&cell.floor)?)
+            .map_err(|error| format!("Failed to build floor block {}: {error}", cell.floor))?;
+        region
+            .set_block([x, 0, 1], &floor)
+            .map_err(|_| "Failed to set floor block.".to_string())?;
+        if let Some(water) = projection_water_block(cell.amount)? {
+            region
+                .set_block([x, 1, 1], &water)
+                .map_err(|_| "Failed to set water block.".to_string())?;
+        }
+    }
+
+    Ok(region)
+}
+
+fn build_projection_region(row: &ResultRow, cycle_count: usize) -> Result<Region, String> {
+    let cells = projection_cells(row, cycle_count);
+    build_projection_region_from_cells(&format!("projection-{}", row.id), &cells)
+}
+
+fn build_projection_world(
+    name: &str,
+    cells: &[CellDescription],
+) -> Result<LoadedSchematic, String> {
+    Ok(LoadedSchematic {
+        name: name.to_string(),
+        region: build_projection_region_from_cells(name, cells)?,
+        approximate_collision_blocks: Vec::new(),
+    })
+}
+
+fn build_projection_verify_command(
+    projection_path: PathBuf,
+    verify_out: PathBuf,
+    args: &Args,
+    row: &ResultRow,
+    cycle_count: usize,
+) -> VerifyCommand {
+    VerifyCommand {
+        input: projection_path,
+        out: verify_out,
+        target_speed: args.target_speed,
+        ticks: projection_verify_ticks(args, row, cycle_count),
+        inspect_tick: None,
+        start_x: 1.0 + row.start_offset,
+        start_y: args.start_y + 1.0,
+        start_z: 1.5,
+        start_vx: args.start_vx,
+        start_vy: args.start_vy,
+        start_vz: 0.0,
+        start_on_ground: args.start_on_ground,
+        width: VERIFY_DEFAULT_WIDTH,
+        height: VERIFY_DEFAULT_HEIGHT,
+        entity_id_mod4: row.entity_id_mod4,
+        initial_tick_count: row.initial_tick_count,
+        entity_rng_seed: None,
+        entity_uuid: None,
+        bootstrap_fluids: false,
+        entity_kind: VerifyEntityKind::Item,
+        no_ai: false,
+        no_gravity: false,
+        fire_immune: false,
+        start_fire_ticks: 0,
+        item_health: None,
+    }
+}
+
+fn build_search_verify_command(
+    args: &Args,
+    ticks: usize,
+    start_offset: f64,
+    entity_id_mod4: usize,
+    initial_tick_count: usize,
+) -> VerifyCommand {
+    VerifyCommand {
+        input: PathBuf::from("projection.litematic"),
+        out: PathBuf::from("artifacts").join("search-verify-temp"),
+        target_speed: args.target_speed,
+        ticks,
+        inspect_tick: None,
+        start_x: 1.0 + start_offset,
+        start_y: args.start_y + 1.0,
+        start_z: 1.5,
+        start_vx: args.start_vx,
+        start_vy: args.start_vy,
+        start_vz: 0.0,
+        start_on_ground: args.start_on_ground,
+        width: VERIFY_DEFAULT_WIDTH,
+        height: VERIFY_DEFAULT_HEIGHT,
+        entity_id_mod4,
+        initial_tick_count,
+        entity_rng_seed: None,
+        entity_uuid: None,
+        bootstrap_fluids: false,
+        entity_kind: VerifyEntityKind::Item,
+        no_ai: false,
+        no_gravity: false,
+        fire_immune: false,
+        start_fire_ticks: 0,
+        item_health: None,
+    }
+}
+
+fn build_search_world(
+    args: &Args,
+    prefix: &PrefixSpec,
+    cycle: &CycleSpec,
+) -> Result<LoadedSchematic, String> {
+    let cycle_count =
+        projection_cycle_count_for_lengths(1, args, prefix.cells.len(), cycle.cells.len());
+    let mut projected_cells = layout_cells_description(&prefix.cells);
+    for _ in 0..cycle_count {
+        projected_cells.extend(layout_cells_description(&cycle.cells));
+    }
+    build_projection_world(
+        &format!("search-{}-{}", prefix.label, cycle.name),
+        &projected_cells,
+    )
+}
+
+fn run_projection_verifications(
+    command: &SearchCommand,
+    args: &Args,
+    payload: &SearchPayload,
+) -> Result<(), String> {
+    if command.export_top_count == 0 || payload.results.is_empty() {
+        return Ok(());
+    }
+
+    let projection_root = args.out.join("verify-projections");
+    fs::create_dir_all(&projection_root)
+        .map_err(|error| format!("Failed to create projection output dir: {error}"))?;
+
+    let rows: Vec<_> = payload
+        .results
+        .iter()
+        .take(command.export_top_count)
+        .cloned()
+        .collect();
+
+    let mut verify_outputs: Vec<(usize, PathBuf, PathBuf, VerifyRunOutput)> = rows
+        .into_par_iter()
+        .enumerate()
+        .map(
+            |(rank, row)| -> Result<(usize, PathBuf, PathBuf, VerifyRunOutput), String> {
+                let cycle_count = projection_cycle_count(command, args, &row);
+                let candidate_dir =
+                    projection_root.join(format!("rank-{:02}-{}", rank + 1, row.id));
+                fs::create_dir_all(&candidate_dir)
+                    .map_err(|error| format!("Failed to create candidate dir: {error}"))?;
+                let projection_path = candidate_dir.join("projection.litematic");
+                let projection_region = build_projection_region(&row, cycle_count)?;
+                save_litematic(
+                    &projection_path,
+                    &format!("projection-{}", row.id),
+                    &projection_region,
+                )?;
+
+                let verify_out = candidate_dir.join("verify");
+                let verify_command = build_projection_verify_command(
+                    projection_path.clone(),
+                    verify_out.clone(),
+                    args,
+                    &row,
+                    cycle_count,
+                );
+                let output = run_verify_command_quiet(&verify_command)?;
+                Ok((rank, projection_path, verify_out, output))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    verify_outputs.sort_by_key(|entry| entry.0);
+    for (rank, projection_path, verify_out, output) in verify_outputs {
+        println!("World: {}", output.world_name);
+        println!(
+            "Shape: {} x {} x {}",
+            output.shape[0], output.shape[1], output.shape[2]
+        );
+        println!("Tick CSV: {}", output.tick_csv_path.display());
+        println!("Summary CSV: {}", output.summary_csv_path.display());
+        println!("Summary JSON: {}", output.summary_json_path.display());
+        if output.approximate_collision_block_count > 0 {
+            println!();
+            println!(
+                "Warning: {} block types use approximate non-solid collision handling.",
+                output.approximate_collision_block_count
+            );
+        }
+        println!(
+            "Projection verify rank {}: {} -> {}",
+            rank + 1,
+            projection_path.display(),
+            verify_out.display()
+        );
+    }
+
+    Ok(())
+}
+
 pub fn main_cli(argv: Vec<String>) -> Result<(), String> {
     let parsed = parse_args(&argv)?;
     match parsed {
@@ -1225,7 +1576,8 @@ pub fn main_cli(argv: Vec<String>) -> Result<(), String> {
         }
         ParsedArgs::Search(command) => {
             let args = search_command_to_args(&command)?;
-            let _ = run_search_outputs(&args)?;
+            let payload = run_search_outputs(&args)?;
+            run_projection_verifications(&command, &args, &payload)?;
             Ok(())
         }
         ParsedArgs::Verify(command) => run_verify_command(&command),
@@ -1569,6 +1921,7 @@ fn cells_signature(cells: &[Cell]) -> String {
     out
 }
 
+#[cfg(test)]
 fn layout_cell_index(
     prefix_length: usize,
     period: usize,
@@ -1588,6 +1941,7 @@ fn layout_cell_index(
     Some(prefix_length + cycle_offset)
 }
 
+#[cfg(test)]
 fn compute_flow_direction(
     cells: &[Cell],
     prefix_length: usize,
@@ -1625,6 +1979,7 @@ fn compute_flow_direction(
     }
 }
 
+#[cfg(test)]
 fn update_fluid_tracker(layout: &Layout, x: f64, y: f64, ignore_current: bool) -> FluidTracker {
     let half_width = WIDTH / 2.0;
     let box_min_x = x - half_width + AABB_DEFLATE;
@@ -1668,6 +2023,7 @@ fn update_fluid_tracker(layout: &Layout, x: f64, y: f64, ignore_current: bool) -
     tracker
 }
 
+#[cfg(test)]
 fn floor_at(layout: &Layout, x: f64) -> Floor {
     layout
         .cell_at(x.floor() as isize)
@@ -1675,6 +2031,7 @@ fn floor_at(layout: &Layout, x: f64) -> Floor {
         .unwrap_or(Floor::Normal)
 }
 
+#[cfg(test)]
 fn apply_fluid_current(vx: f64, tracker: FluidTracker) -> f64 {
     if tracker.current_count == 0
         || tracker.accumulated_current_x * tracker.accumulated_current_x < FLUID_CURRENT_EPSILON2
@@ -1693,6 +2050,7 @@ fn apply_fluid_current(vx: f64, tracker: FluidTracker) -> f64 {
     }
     vx + impulse
 }
+#[cfg(test)]
 fn horizontal_drag(floor: Floor, on_ground: bool, vy: f64) -> f64 {
     let mut drag = HORIZONTAL_MOVEMENT_DAMPING;
     if on_ground {
@@ -1704,6 +2062,7 @@ fn horizontal_drag(floor: Floor, on_ground: bool, vy: f64) -> f64 {
     drag
 }
 
+#[cfg(test)]
 fn vertical_velocity_after_landing(floor: Floor, vy: f64) -> f64 {
     if matches!(floor.step_on(), StepOn::Slime) {
         if vy < 0.0 { -vy * 0.8 } else { vy }
@@ -1712,6 +2071,7 @@ fn vertical_velocity_after_landing(floor: Floor, vy: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn simulate(layout: &Layout, config: &SimConfig) -> Simulation {
     let n = config.ticks + 1;
     let mut xs = vec![0.0; n];
@@ -2188,6 +2548,43 @@ fn stable_id(text: &str) -> String {
     format!("{:08x}", hash)
 }
 
+fn compare_early_candidates(left: &EarlyCandidate, right: &EarlyCandidate) -> Ordering {
+    left.early_score
+        .total_cmp(&right.early_score)
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn compare_structure_beam_candidates(
+    left: &StructureBeamCandidate,
+    right: &StructureBeamCandidate,
+) -> Ordering {
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| left.cycle_index.cmp(&right.cycle_index))
+        .then_with(|| left.prefix_index.cmp(&right.prefix_index))
+}
+
+fn compare_result_rows(left: &ResultRow, right: &ResultRow) -> Ordering {
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn representative_start_offset(start_offsets: &[f64]) -> f64 {
+    start_offsets[start_offsets.len() / 2]
+}
+
+fn structure_beam_limit(args: &Args, total_structures: usize) -> usize {
+    if total_structures <= 1024 {
+        return total_structures;
+    }
+    let base = match args.mode {
+        Mode::Early => args.early_limit.max(args.top).saturating_mul(8),
+        Mode::Full => args.long_limit.max(args.top).saturating_mul(16),
+    };
+    base.clamp(128, total_structures)
+}
+
 fn candidate_dedupe_key(
     candidate: &EarlyCandidate,
     prefixes: &[PrefixSpec],
@@ -2220,7 +2617,7 @@ fn dedupe_early_candidates(
         positions.insert(key, ordered.len());
         ordered.push(candidate);
     }
-    ordered.sort_by(|left, right| left.early_score.total_cmp(&right.early_score));
+    ordered.sort_by(compare_early_candidates);
     ordered
 }
 
@@ -2235,28 +2632,107 @@ pub fn search(args: &Args) -> SearchPayload {
             .map(|index| 0.125 + index as f64 * (0.75 / (args.start_samples - 1) as f64))
             .collect::<Vec<_>>()
     };
-    let early_ticks = args.ticks.min(5 + args.cadence_pairs * 2 + 4);
+    let early_ticks = args
+        .ticks
+        .min(5 + args.cadence_pairs * args.target_ticks.max(1) + 4);
 
-    let mut evaluated = 0_usize;
-    let mut early_candidates = Vec::new();
+    let evaluated = cycles.len() * prefixes.len() * start_offsets.len() * 4;
+    let combo_indices: Vec<_> = cycles
+        .iter()
+        .enumerate()
+        .flat_map(|(cycle_index, _)| {
+            prefixes
+                .iter()
+                .enumerate()
+                .map(move |(prefix_index, _)| (cycle_index, prefix_index))
+        })
+        .collect();
 
-    for (cycle_index, cycle) in cycles.iter().enumerate() {
-        for (prefix_index, prefix) in prefixes.iter().enumerate() {
-            let layout = Layout::new(&prefix.cells, &cycle.cells);
+    let retained_structures = structure_beam_limit(args, combo_indices.len());
+    let beam_start_offset = representative_start_offset(&start_offsets);
+    let mut structure_beam: Vec<StructureBeamCandidate> = if retained_structures
+        >= combo_indices.len()
+    {
+        combo_indices
+            .iter()
+            .map(|&(cycle_index, prefix_index)| StructureBeamCandidate {
+                prefix_index,
+                cycle_index,
+                score: 0.0,
+            })
+            .collect()
+    } else {
+        let mut coarse = combo_indices
+            .into_par_iter()
+            .filter_map(|(cycle_index, prefix_index)| {
+                let cycle = &cycles[cycle_index];
+                let prefix = &prefixes[prefix_index];
+                let world = build_search_world(args, prefix, cycle).ok()?;
+                let mut best_score = f64::INFINITY;
+
+                for entity_id_mod4 in [0_usize, 2_usize] {
+                    let verify_command = build_search_verify_command(
+                        args,
+                        early_ticks,
+                        beam_start_offset,
+                        entity_id_mod4,
+                        0,
+                    );
+                    let verify_trace = simulate_verify_trace(&world, &verify_command);
+                    let sim = simulation_from_verify_trace(&verify_trace);
+                    let early =
+                        best_early_cadence(&sim, 5, args.cadence_pairs, args.cadence_tolerance)?;
+                    let mut score = early_candidate_score(&early, prefix.cells.len());
+                    if early.cadence_pass {
+                        score -= 500.0;
+                    }
+                    score -= early.cadence_block_hit_rate * 200.0;
+                    score -= early.cadence_within_tolerance_rate * 100.0;
+                    best_score = best_score.min(score);
+                }
+
+                if best_score.is_finite() {
+                    Some(StructureBeamCandidate {
+                        prefix_index,
+                        cycle_index,
+                        score: best_score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        coarse.sort_by(compare_structure_beam_candidates);
+        coarse.truncate(retained_structures);
+        coarse
+    };
+
+    structure_beam.sort_by(compare_structure_beam_candidates);
+
+    let mut early_candidates: Vec<EarlyCandidate> = structure_beam
+        .into_par_iter()
+        .flat_map_iter(|structure| {
+            let cycle_index = structure.cycle_index;
+            let prefix_index = structure.prefix_index;
+            let cycle = &cycles[cycle_index];
+            let prefix = &prefixes[prefix_index];
+            let world = match build_search_world(args, prefix, cycle) {
+                Ok(world) => world,
+                Err(_) => return Vec::new(),
+            };
+
+            let mut local_candidates = Vec::new();
             for &start_offset in &start_offsets {
                 for entity_id_mod4 in 0..4 {
-                    let config = SimConfig {
-                        ticks: early_ticks,
-                        start_x: start_offset,
-                        start_y: args.start_y,
-                        start_vx: args.start_vx,
-                        start_vy: args.start_vy,
+                    let verify_command = build_search_verify_command(
+                        args,
+                        early_ticks,
+                        start_offset,
                         entity_id_mod4,
-                        initial_tick_count: 0,
-                        start_on_ground: Some(args.start_on_ground),
-                    };
-                    evaluated += 1;
-                    let early_sim = simulate(&layout, &config);
+                        0,
+                    );
+                    let verify_trace = simulate_verify_trace(&world, &verify_command);
+                    let early_sim = simulation_from_verify_trace(&verify_trace);
                     let Some(early) = best_early_cadence(
                         &early_sim,
                         5,
@@ -2275,7 +2751,7 @@ pub fn search(args: &Args) -> SearchPayload {
                         "{}|{}|start={}|id={}|tick=0",
                         prefix.label, cycle.name, start_offset, entity_id_mod4
                     );
-                    early_candidates.push(EarlyCandidate {
+                    local_candidates.push(EarlyCandidate {
                         id: stable_id(&id_text),
                         early_score: early_candidate_score(&early, prefix.cells.len()),
                         prefix_index,
@@ -2287,10 +2763,11 @@ pub fn search(args: &Args) -> SearchPayload {
                     });
                 }
             }
-        }
-    }
+            local_candidates
+        })
+        .collect();
 
-    early_candidates.sort_by(|left, right| left.early_score.total_cmp(&right.early_score));
+    early_candidates.sort_by(compare_early_candidates);
 
     let ranked_early_candidates = if args.dedupe_long {
         dedupe_early_candidates(early_candidates.clone(), &prefixes, &cycles)
@@ -2342,65 +2819,73 @@ pub fn search(args: &Args) -> SearchPayload {
         early_limited
     };
 
-    let mut results = Vec::new();
-    for candidate in &candidates_to_verify {
-        let prefix = &prefixes[candidate.prefix_index];
-        let cycle = &cycles[candidate.cycle_index];
-        let layout = Layout::new(&prefix.cells, &cycle.cells);
-        let config = SimConfig {
-            ticks: args.ticks,
-            start_x: candidate.start_offset,
-            start_y: args.start_y,
-            start_vx: args.start_vx,
-            start_vy: args.start_vy,
-            entity_id_mod4: candidate.entity_id_mod4,
-            initial_tick_count: candidate.initial_tick_count,
-            start_on_ground: Some(args.start_on_ground),
-        };
-        let sim = simulate(&layout, &config);
-        let Some(long) = best_long_window(&sim, args.long_window) else {
-            continue;
-        };
-        let suffix = suffix_long_metrics(
-            &sim,
-            candidate.cadence.cadence_start_tick,
-            args.long_window.min(args.ticks.saturating_sub(10)),
-        );
-        let Some(full) = full_cadence_metrics(
-            &sim,
-            candidate.cadence.cadence_start_tick,
-            args.full_cadence_pairs,
-            args.full_cadence_tolerance,
-        ) else {
-            continue;
-        };
-        let pass = classify_verified_candidate(&candidate.cadence, &full, &long, suffix.as_ref());
-        if pass == "weak" && !candidate.cadence.cadence_pass && !args.keep_weak {
-            continue;
-        }
-        let score = verified_candidate_score(
-            &candidate.cadence,
-            &full,
-            &long,
-            suffix.as_ref(),
-            prefix.cells.len(),
-            &prefix.label,
-            cycle.proven,
-        );
-        results.push(full_result_row(
-            candidate,
-            prefix,
-            cycle,
-            pass,
-            score,
-            &full,
-            &long,
-            suffix.as_ref(),
-            &sim,
-        ));
-    }
+    let mut results: Vec<ResultRow> = candidates_to_verify
+        .par_iter()
+        .filter_map(|candidate| {
+            let prefix = &prefixes[candidate.prefix_index];
+            let cycle = &cycles[candidate.cycle_index];
+            let cycle_count =
+                projection_cycle_count_for_lengths(1, args, prefix.cells.len(), cycle.cells.len());
+            let mut projected_cells = layout_cells_description(&prefix.cells);
+            for _ in 0..cycle_count {
+                projected_cells.extend(layout_cells_description(&cycle.cells));
+            }
+            let Ok(world) = build_projection_world(
+                &format!("search-{}-{}", prefix.label, cycle.name),
+                &projected_cells,
+            ) else {
+                return None;
+            };
+            let verify_command = build_search_verify_command(
+                args,
+                args.ticks,
+                candidate.start_offset,
+                candidate.entity_id_mod4,
+                candidate.initial_tick_count,
+            );
+            let verify_trace = simulate_verify_trace(&world, &verify_command);
+            let sim = simulation_from_verify_trace(&verify_trace);
+            let long = best_long_window(&sim, args.long_window)?;
+            let suffix = suffix_long_metrics(
+                &sim,
+                candidate.cadence.cadence_start_tick,
+                args.long_window.min(args.ticks.saturating_sub(10)),
+            );
+            let full = full_cadence_metrics(
+                &sim,
+                candidate.cadence.cadence_start_tick,
+                args.full_cadence_pairs,
+                args.full_cadence_tolerance,
+            )?;
+            let pass =
+                classify_verified_candidate(&candidate.cadence, &full, &long, suffix.as_ref());
+            if pass == "weak" && !candidate.cadence.cadence_pass && !args.keep_weak {
+                return None;
+            }
+            let score = verified_candidate_score(
+                &candidate.cadence,
+                &full,
+                &long,
+                suffix.as_ref(),
+                prefix.cells.len(),
+                &prefix.label,
+                cycle.proven,
+            );
+            Some(full_result_row(
+                candidate,
+                prefix,
+                cycle,
+                pass,
+                score,
+                &full,
+                &long,
+                suffix.as_ref(),
+                &sim,
+            ))
+        })
+        .collect();
 
-    results.sort_by(|left, right| left.score.total_cmp(&right.score));
+    results.sort_by(compare_result_rows);
 
     SearchPayload {
         evaluated,
@@ -2439,6 +2924,45 @@ fn first_ticks(sim: &Simulation) -> Vec<FirstTick> {
             on_ground: sim.on_grounds[tick] != 0,
         })
         .collect()
+}
+
+fn floor_from_support_block(support_block: &str) -> Floor {
+    if support_block.starts_with("minecraft:packed_ice") {
+        Floor::PackedIce
+    } else if support_block.starts_with("minecraft:blue_ice") {
+        Floor::BlueIce
+    } else if support_block.starts_with("minecraft:slime_block") {
+        Floor::Slime
+    } else {
+        Floor::Normal
+    }
+}
+
+fn simulation_from_verify_trace(trace: &[VerifyTracePoint]) -> Simulation {
+    let mut xs = Vec::with_capacity(trace.len());
+    let mut ys = Vec::with_capacity(trace.len());
+    let mut vxs = Vec::with_capacity(trace.len());
+    let mut vys = Vec::with_capacity(trace.len());
+    let mut on_grounds = Vec::with_capacity(trace.len());
+    let mut floors = Vec::with_capacity(trace.len());
+
+    for row in trace {
+        xs.push(row.x);
+        ys.push(row.y);
+        vxs.push(row.vx);
+        vys.push(row.vy);
+        on_grounds.push(u8::from(row.on_ground));
+        floors.push(floor_from_support_block(&row.support_block));
+    }
+
+    Simulation {
+        xs,
+        ys,
+        vxs,
+        vys,
+        on_grounds,
+        floors,
+    }
 }
 
 fn early_result_row(
@@ -2903,6 +3427,7 @@ fn write_json(path: &Path, payload: &SearchPayload, args: &Args) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mc_schem::region::WorldSlice;
 
     #[test]
     fn parse_args_bumps_full_ticks_for_full_cadence() {
@@ -3072,6 +3597,198 @@ mod tests {
         assert_eq!(command.item_health, Some(9));
     }
 
+    fn projection_test_row() -> ResultRow {
+        ResultRow {
+            id: "deadbeef".to_string(),
+            pass: "early".to_string(),
+            score: 1.0,
+            early_score: 1.0,
+            prefix_label: "DB-R2N".to_string(),
+            prefix_length: 3,
+            backbone: "W3-I_D3-B".to_string(),
+            proven: true,
+            start_offset: 0.875,
+            entity_id_mod4: 0,
+            initial_tick_count: 0,
+            period: 3,
+            cadence_start_tick: 2,
+            cadence_pairs: 4,
+            cadence_mean_abs_distance_error: 0.0,
+            cadence_mean_signed_distance_error: 0.0,
+            cadence_max_abs_distance_error: 0.0,
+            cadence_block_hit_rate: 1.0,
+            cadence_within_tolerance_rate: 1.0,
+            cadence_pass: true,
+            cadence_samples: Vec::new(),
+            full_cadence_start_tick: None,
+            full_cadence_pairs: None,
+            full_cadence_mean_abs_distance_error: None,
+            full_cadence_mean_signed_distance_error: None,
+            full_cadence_max_abs_distance_error: None,
+            full_cadence_block_hit_rate: None,
+            full_cadence_within_tolerance_rate: None,
+            full_cadence_longest_hit_run: None,
+            full_cadence_average_speed: None,
+            full_cadence_distance: None,
+            full_cadence_first_miss: None,
+            full_cadence_min_hit_margin: None,
+            full_cadence_mean_hit_margin: None,
+            full_cadence_min_endpoint_boundary_margin: None,
+            full_cadence_mean_endpoint_boundary_margin: None,
+            full_cadence_samples: None,
+            long_window_start_tick: None,
+            long_average_vx: None,
+            long_mean_vx_error: None,
+            long_std_vx: None,
+            long_average_distance_vx: None,
+            suffix_average_vx: None,
+            suffix_mean_vx_error: None,
+            suffix_std_vx: None,
+            suffix_average_distance_vx: None,
+            first_ticks: None,
+            prefix_cells: vec![
+                CellDescription {
+                    index: 0,
+                    surface: None,
+                    flow: 0,
+                    derived_flow_hint: Some(0),
+                    amount: 0,
+                    floor: "blue_ice".to_string(),
+                    code: "DB".to_string(),
+                },
+                CellDescription {
+                    index: 1,
+                    surface: Some(7.0 / 9.0),
+                    flow: -1,
+                    derived_flow_hint: None,
+                    amount: 7,
+                    floor: "normal".to_string(),
+                    code: "RN".to_string(),
+                },
+                CellDescription {
+                    index: 2,
+                    surface: Some(8.0 / 9.0),
+                    flow: -1,
+                    derived_flow_hint: None,
+                    amount: 8,
+                    floor: "normal".to_string(),
+                    code: "RN".to_string(),
+                },
+            ],
+            cycle_cells: vec![
+                CellDescription {
+                    index: 0,
+                    surface: Some(8.0 / 9.0),
+                    flow: 1,
+                    derived_flow_hint: None,
+                    amount: 8,
+                    floor: "packed_ice".to_string(),
+                    code: "FI".to_string(),
+                },
+                CellDescription {
+                    index: 1,
+                    surface: Some(7.0 / 9.0),
+                    flow: 1,
+                    derived_flow_hint: None,
+                    amount: 7,
+                    floor: "packed_ice".to_string(),
+                    code: "FI".to_string(),
+                },
+                CellDescription {
+                    index: 2,
+                    surface: None,
+                    flow: 0,
+                    derived_flow_hint: Some(0),
+                    amount: 0,
+                    floor: "blue_ice".to_string(),
+                    code: "DB".to_string(),
+                },
+            ],
+            note: "test row".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_search_args_reads_mode_and_export_flags() {
+        let argv = vec![
+            "--mode".to_string(),
+            "early".to_string(),
+            "--export-cycles".to_string(),
+            "5".to_string(),
+            "--export-top-count".to_string(),
+            "2".to_string(),
+        ];
+        let command = parse_search_args(&argv).expect("search args should parse");
+        assert_eq!(command.mode, Mode::Early);
+        assert_eq!(command.export_cycles, 5);
+        assert_eq!(command.export_top_count, 2);
+    }
+
+    #[test]
+    fn search_command_fast_preset_uses_verify_sized_limits() {
+        let command = SearchCommand {
+            out: PathBuf::from("artifacts/test"),
+            top: 20,
+            target_speed: 0.5,
+            mode: Mode::Full,
+            effort: EffortPreset::Fast,
+            export_cycles: 4,
+            export_top_count: 1,
+            start_y: 0.0,
+            start_vx: 1.0,
+            start_vy: 0.0,
+            start_on_ground: true,
+        };
+        let args = search_command_to_args(&command).expect("preset should translate");
+        assert_eq!(args.ticks, 120);
+        assert_eq!(args.top, 10);
+        assert_eq!(args.max_prefix, 2);
+        assert_eq!(args.cadence_pairs, 4);
+        assert_eq!(args.long_window, 48);
+        assert_eq!(args.start_samples, 3);
+        assert_eq!(args.early_limit, 40);
+        assert_eq!(args.long_limit, 8);
+        assert_eq!(args.full_cadence_pairs, 80);
+    }
+
+    #[test]
+    fn build_projection_region_maps_cells_to_blocks() {
+        let row = projection_test_row();
+        let region = build_projection_region(&row, 2).expect("projection region should build");
+        assert_eq!(
+            region.block_at([1, 0, 1]).expect("floor block").full_id(),
+            "minecraft:blue_ice"
+        );
+        assert_eq!(
+            region
+                .block_at([2, 1, 1])
+                .expect("flowing water block")
+                .full_id(),
+            "minecraft:water[level=1]"
+        );
+        assert_eq!(
+            region
+                .block_at([3, 1, 1])
+                .expect("source water block")
+                .full_id(),
+            "minecraft:water"
+        );
+        assert_eq!(
+            region
+                .block_at([4, 0, 1])
+                .expect("cycle floor block")
+                .full_id(),
+            "minecraft:packed_ice"
+        );
+        assert_eq!(
+            region
+                .block_at([6, 0, 1])
+                .expect("dry cycle floor block")
+                .full_id(),
+            "minecraft:blue_ice"
+        );
+    }
+
     #[test]
     fn fluid_tracker_uses_item_height_threshold() {
         let layout = Layout::new(&[cell(Some(0.1), 0, Floor::Normal, Some(1))], &[]);
@@ -3107,7 +3824,7 @@ mod tests {
     }
 
     #[test]
-    fn search_small_case_stays_empty_with_stricter_fluid_ordering() {
+    fn search_small_case_uses_verify_driven_candidates() {
         let args = Args {
             out: PathBuf::from("artifacts/test"),
             mode: Mode::Early,
@@ -3136,6 +3853,11 @@ mod tests {
         };
         let payload = search(&args);
         assert_eq!(payload.evaluated, 27972);
-        assert!(payload.results.is_empty());
+        assert_eq!(payload.results.len(), 5);
+        assert_eq!(payload.results[0].backbone, "W2-BI_S2-B");
+        assert_eq!(payload.results[0].prefix_label, "DB-SN");
+        assert_eq!(payload.results[0].start_offset, 0.875);
+        assert_eq!(payload.results[0].cadence_start_tick, 5);
+        assert_eq!(payload.results[0].cadence_block_hit_rate, 1.0);
     }
 }
