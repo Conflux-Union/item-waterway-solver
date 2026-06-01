@@ -47,7 +47,10 @@ if [[ ! -f "$properties_file" ]]; then
   exit 1
 fi
 
-perl -0pi -e "s/^level-name=.*/level-name=$world_name/m; s/^server-port=.*/server-port=$port/m" "$properties_file"
+WORLD_NAME="$world_name" PORT="$port" perl -0pi -e '
+  s/^level-name=.*/"level-name=$ENV{WORLD_NAME}"/me;
+  s/^server-port=.*/"server-port=$ENV{PORT}"/me;
+' "$properties_file"
 
 echo "Prepared isolated probe root:"
 echo "  root: $dest_root"

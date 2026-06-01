@@ -1,0 +1,10 @@
+# Save a big dripleaf stem that lacks the required head block above it.
+setworldspawn 0 80 0
+forceload remove all
+forceload add 160 160
+fill 158 63 158 162 69 162 air
+setblock 160 63 160 moss_block
+setblock 160 64 160 big_dripleaf_stem[facing=north,waterlogged=false]
+execute if block 160 64 160 minecraft:big_dripleaf_stem run say STEM_SETUP_PRESENT
+forceload remove 160 160
+save-all flush

@@ -116,6 +116,19 @@ pub(crate) fn load_litematic(path: &Path) -> Result<LoadedSchematic, String> {
     })
 }
 
+pub(crate) fn save_litematic(path: &Path, name: &str, region: &Region) -> Result<(), String> {
+    let filename = path
+        .to_str()
+        .ok_or_else(|| format!("Projection path is not valid UTF-8: {}", path.display()))?;
+    let mut schematic = Schematic::new();
+    let mut export_region = region.clone();
+    export_region.name = name.to_string();
+    schematic.regions.push(export_region);
+    schematic
+        .save_to_file(filename)
+        .map_err(|error| format!("Failed to write litematic {}: {error}", path.display()))
+}
+
 pub(crate) fn block_full_id(block: &Block) -> String {
     block.full_id()
 }

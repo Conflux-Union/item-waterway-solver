@@ -1,0 +1,11 @@
+# Save an unsupported big dripleaf stem plus leaf chain with no valid support below.
+setworldspawn 0 80 0
+forceload remove all
+forceload add 224 224
+fill 222 63 222 226 70 226 air
+setblock 224 64 224 big_dripleaf_stem[facing=north,waterlogged=false]
+setblock 224 65 224 big_dripleaf[facing=north,tilt=none,waterlogged=false]
+execute if block 224 64 224 minecraft:big_dripleaf_stem run say STEM_SETUP_PRESENT
+execute if block 224 65 224 minecraft:big_dripleaf run say LEAF_SETUP_PRESENT
+forceload remove 224 224
+save-all flush

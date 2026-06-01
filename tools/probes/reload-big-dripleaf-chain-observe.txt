@@ -1,0 +1,12 @@
+# Load the saved stem plus leaf chain and check whether both parts are gone before the first manual tick.
+tick freeze
+forceload add 224 224
+execute if block 224 64 224 minecraft:big_dripleaf_stem run say STEM_T0_PRESENT
+execute unless block 224 64 224 minecraft:big_dripleaf_stem run say STEM_T0_NOT_PRESENT
+execute if block 224 65 224 minecraft:big_dripleaf run say LEAF_T0_PRESENT
+execute unless block 224 65 224 minecraft:big_dripleaf run say LEAF_T0_NOT_PRESENT
+tick step 1
+execute if block 224 64 224 minecraft:big_dripleaf_stem run say STEM_T1_PRESENT
+execute unless block 224 64 224 minecraft:big_dripleaf_stem run say STEM_T1_NOT_PRESENT
+execute if block 224 65 224 minecraft:big_dripleaf run say LEAF_T1_PRESENT
+execute unless block 224 65 224 minecraft:big_dripleaf run say LEAF_T1_NOT_PRESENT

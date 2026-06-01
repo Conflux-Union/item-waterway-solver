@@ -1,0 +1,14 @@
+# Load the saved bubble column under tick freeze so the delayed correction is visible.
+tick freeze
+forceload add 128 128
+execute if block 128 64 128 minecraft:bubble_column run say BUBBLE_T0_COLUMN
+execute if block 128 64 128 minecraft:water run say BUBBLE_T0_WATER
+execute if block 128 64 128 minecraft:air run say BUBBLE_T0_AIR
+tick step 1
+execute if block 128 64 128 minecraft:bubble_column run say BUBBLE_T1_COLUMN
+execute if block 128 64 128 minecraft:water run say BUBBLE_T1_WATER
+execute if block 128 64 128 minecraft:air run say BUBBLE_T1_AIR
+tick step 4
+execute if block 128 64 128 minecraft:bubble_column run say BUBBLE_T5_COLUMN
+execute if block 128 64 128 minecraft:water run say BUBBLE_T5_WATER
+execute if block 128 64 128 minecraft:air run say BUBBLE_T5_AIR

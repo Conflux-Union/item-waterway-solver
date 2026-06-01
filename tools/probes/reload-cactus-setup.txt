@@ -1,0 +1,11 @@
+# Save a cactus with an illegal solid horizontal neighbour so reload can classify it.
+setworldspawn 0 80 0
+forceload remove all
+forceload add 192 192
+fill 190 63 190 194 68 194 air
+setblock 192 63 192 sand
+setblock 193 64 192 stone
+setblock 192 64 192 cactus[age=0]
+execute if block 192 64 192 minecraft:cactus run say CACTUS_SETUP_PRESENT
+forceload remove 192 192
+save-all flush

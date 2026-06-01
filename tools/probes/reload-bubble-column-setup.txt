@@ -1,0 +1,11 @@
+# Save an unsupported bubble column away from spawn so reload can classify it.
+setworldspawn 0 80 0
+forceload remove all
+forceload add 128 128
+kill @e[type=minecraft:item,tag=codex_probe]
+fill 126 63 126 130 68 130 air
+setblock 128 63 128 stone
+setblock 128 64 128 bubble_column[drag=false]
+execute if block 128 64 128 minecraft:bubble_column run say BUBBLE_SETUP_COLUMN
+forceload remove 128 128
+save-all flush

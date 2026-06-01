@@ -1,0 +1,8 @@
+# Load the saved cactus and check whether reload removes it before the first manual tick.
+tick freeze
+forceload add 192 192
+execute if block 192 64 192 minecraft:cactus run say CACTUS_T0_PRESENT
+execute unless block 192 64 192 minecraft:cactus run say CACTUS_T0_NOT_PRESENT
+tick step 1
+execute if block 192 64 192 minecraft:cactus run say CACTUS_T1_PRESENT
+execute unless block 192 64 192 minecraft:cactus run say CACTUS_T1_NOT_PRESENT
